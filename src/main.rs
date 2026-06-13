@@ -1,10 +1,12 @@
 mod clip;
 
-use aws_config::{meta::credentials::CredentialsProvider, BehaviorVersion};
+use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
+use aws_credential_types::provider::SharedCredentialsProvider; // <-- Correct v1.x import
+use aws_credential_types::Credentials;                         // <-- Correct v1.x import
 use clap::Parser;
 use std::fs::File as StdFile;
-use std::io::{Read, Cursor};
+use std::io::{Read};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use async_zip::tokio::write::ZipFileWriter;
@@ -38,7 +40,6 @@ struct CdEntry {
     is_deflated: bool,
 }
 
-// ... (resolve_uri and parse_central_directory functions remain the same)
 fn resolve_uri(base: &str, uri: &str) -> String {
     let clean_uri = if uri.starts_with("./") { &uri[2..] } else { uri };
     if clean_uri.starts_with('/') { return clean_uri[1..].to_string(); }
@@ -59,19 +60,24 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
     let mut entries = Vec::new();
     let mut curr = 0;
     let len = cd_bytes.len();
+
     while curr + 46 <= len {
         if &cd_bytes[curr..curr+4] != &[0x50, 0x4b, 0x01, 0x02] {
             break;
         }
+
         let comp_method = u16::from_le_bytes(cd_bytes[curr+10..curr+12].try_into().unwrap());
         let is_deflated = comp_method == 8;
+
         let mut comp_size = u32::from_le_bytes(cd_bytes[curr+20..curr+24].try_into().unwrap()) as u64;
         let mut uncomp_size = u32::from_le_bytes(cd_bytes[curr+24..curr+28].try_into().unwrap()) as u64;
         let name_len = u16::from_le_bytes(cd_bytes[curr+28..curr+30].try_into().unwrap()) as usize;
         let extra_len = u16::from_le_bytes(cd_bytes[curr+30..curr+32].try_into().unwrap()) as usize;
         let comment_len = u16::from_le_bytes(cd_bytes[curr+32..curr+34].try_into().unwrap()) as usize;
         let mut header_offset = u32::from_le_bytes(cd_bytes[curr+42..curr+46].try_into().unwrap()) as u64;
+
         let filename = std::str::from_utf8(&cd_bytes[curr+46..curr+46+name_len]).unwrap_or("").to_string();
+
         if extra_len > 0 && (uncomp_size == 0xFFFFFFFF || comp_size == 0xFFFFFFFF || header_offset == 0xFFFFFFFF) {
             let extra_start = curr + 46 + name_len;
             let extra_end = extra_start + extra_len;
@@ -96,38 +102,47 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
                 ptr += 4 + sz;
             }
         }
+
         entries.push(CdEntry {
             filename,
             header_offset,
             compressed_size: comp_size,
             is_deflated,
         });
+
         curr += 46 + name_len + extra_len + comment_len;
     }
     entries
 }
 
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    
     let mut geojson_str = String::new();
     if args.geojson == "-" {
+        if args.debug {
+            println!("Reading GeoJSON clipping boundary from standard input (stdin)...");
+        }
         std::io::stdin().read_to_string(&mut geojson_str)?;
     } else {
         let mut geojson_file = StdFile::open(&args.geojson)?;
         geojson_file.read_to_string(&mut geojson_str)?;
     }
+    
     let clip_polygon = clip::parse_geojson_polygon(&geojson_str).expect("Failed to parse GeoJSON");
 
-    // --- CLIENT CONFIGURATION ---
+    let _config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+    
+    // Setup Client Config
     let s3_client = if args.no_sign_request {
         if args.debug {
             println!("[DEBUG] Using anonymous S3 client (no-sign-request).");
         }
+        let credentials = Credentials::new("anonymous", "anonymous", None, None, "anonymous");
         let config = aws_config::defaults(BehaviorVersion::latest())
-            .credentials_provider(CredentialsProvider::anonymous())
-            .region(Region::new("us-east-1")) // Must provide a region for anonymous
+            .credentials_provider(SharedCredentialsProvider::new(credentials))
+            .region(Region::new("us-east-1")) // Region is required for anonymous
             .load()
             .await;
         aws_sdk_s3::Client::new(&config)
@@ -139,8 +154,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.debug {
         println!("Connecting to s3://{}/{}...", args.bucket, args.key);
     }
-    
-    // ... (The rest of the main function remains exactly the same)
+
     let head = s3_client.head_object().bucket(&args.bucket).key(&args.key).send().await?;
     let file_size = head.content_length().expect("Missing content-length") as u64;
 
@@ -177,11 +191,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.debug {
         println!("[DEBUG] Fetching Central Directory from S3 ({} bytes)...", cd_size);
     }
+
     let resp = s3_client.get_object().bucket(&args.bucket).key(&args.key)
         .range(format!("bytes={}-{}", cd_offset, cd_offset + cd_size - 1)).send().await?;
     let cd_bytes = resp.body.collect().await?.into_bytes();
 
     let archive_entries = parse_central_directory(&cd_bytes);
+
     if args.debug {
         println!("[DEBUG] Mapped {} file entries from Central Directory.", archive_entries.len());
     }
@@ -274,7 +290,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let task = tokio::spawn(async move {
                 let _permit = semaphore_clone.acquire_owned().await.unwrap();
+                
                 if let Some(ref bar) = pb_clone { bar.set_message(format!("Fetching {}", target_filename)); }
+                
                 let range_end = header_offset + 30 + filename_len as u64 + 256 + compressed_size;
                 
                 let resp = match client_clone.get_object()
@@ -390,6 +408,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     file.seek(SeekFrom::Start(index_header_offset + 14)).await?;
     file.write_all(&crc32.to_le_bytes()).await?;
     
-    println!("Success! Clipped dataset complete");
+    println!("Success! Clipped dataset is fully 3tz compliant.");
     Ok(())
 }
