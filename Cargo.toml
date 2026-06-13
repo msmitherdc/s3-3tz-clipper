@@ -1,14 +1,17 @@
 [package]
 name = "s3-3tz-clipper"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full", "fs"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 clap = { version = "4.4", features = ["derive"] }
-aws-config = { version = "1.1.7", features = ["behavior-version-latest"] } # Stable late-v1 config
-aws-sdk-s3 = "1.135.0"                                                   # Latest S3 SDK (as of June 2026)
+aws-config = { version = "1.1.7", default-features = false, features = ["behavior-version-latest", "rustls", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.135.0", default-features = false, features = ["rustls", "rt-tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = "0.22"
+rustls-pemfile = "2.1"
 async_zip = { version = "0.0.17", features = ["tokio", "deflate"] }
 geojson = "0.24"
 geo = "0.27"
@@ -22,4 +25,3 @@ crc32fast = "1.3"
 flate2 = "1.0"
 zip = "0.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", features = ["json"] }
