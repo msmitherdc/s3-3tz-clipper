@@ -2,8 +2,8 @@ mod clip;
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
-use aws_credential_types::provider::SharedCredentialsProvider; // <-- Correct v1.x import
-use aws_credential_types::Credentials;                         // <-- Correct v1.x import
+use aws_credential_types::provider::SharedCredentialsProvider; // <-- Correct
+use aws_credential_types::Credentials;
 use clap::Parser;
 use std::fs::File as StdFile;
 use std::io::{Read};
@@ -132,9 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     let clip_polygon = clip::parse_geojson_polygon(&geojson_str).expect("Failed to parse GeoJSON");
 
-    let _config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    
-    // Setup Client Config
+    // --- CLIENT CONFIGURATION ---
     let s3_client = if args.no_sign_request {
         if args.debug {
             println!("[DEBUG] Using anonymous S3 client (no-sign-request).");
@@ -142,7 +140,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let credentials = Credentials::new("anonymous", "anonymous", None, None, "anonymous");
         let config = aws_config::defaults(BehaviorVersion::latest())
             .credentials_provider(SharedCredentialsProvider::new(credentials))
-            .region(Region::new("us-east-1")) // Region is required for anonymous
+            // Force the client to use the correct region for the public bucket
+            .region(Region::new("us-east-1"))
             .load()
             .await;
         aws_sdk_s3::Client::new(&config)
