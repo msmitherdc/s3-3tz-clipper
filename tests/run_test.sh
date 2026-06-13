@@ -36,7 +36,7 @@ EOF
 echo "==========================================="
 echo "3. Clipping S3 Dataset (s3://$BUCKET/$KEY)"
 echo "==========================================="
-./target/x86_64-unknown-linux-gnu/release/s3-3tz-clipper \
+/home/runner/work/s3-3tz-clipper/s3-3tz-clipper \
   --bucket "$BUCKET" \
   --key "$KEY" \
   --geojson "jacksonville_clip.geojson" \
