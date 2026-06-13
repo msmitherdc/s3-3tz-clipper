@@ -1,5 +1,6 @@
 mod clip;
 
+use tracing_subscriber::EnvFilter;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use clap::Parser;
@@ -116,6 +117,17 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    
+    // Initialize standard AWS logging if debug is enabled
+    if args.debug {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new("aws_config=debug,aws_sdk_s3=debug,hyper=debug"))
+            )
+            .init();
+        println!("[DEBUG] Diagnostic Tracing logger initialized.");
+    }
     
     let mut geojson_str = String::new();
     if args.geojson == "-" {
