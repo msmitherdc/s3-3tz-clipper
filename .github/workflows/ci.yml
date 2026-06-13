@@ -59,7 +59,7 @@ jobs:
       #     aws-region: ${{ env.AWS_REGION }}
 
       - name: Compile Application
-        run: cargo build --release
+        run: cargo build --release 
 
       - name: Run Test Script
         run: |

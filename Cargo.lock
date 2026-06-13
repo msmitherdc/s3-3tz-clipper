@@ -2576,9 +2576,7 @@ version = "0.1.0"
 dependencies = [
  "async_zip",
  "aws-config",
- "aws-credential-types",
  "aws-sdk-s3",
- "byteorder",
  "clap",
  "crc32fast",
  "flate2",

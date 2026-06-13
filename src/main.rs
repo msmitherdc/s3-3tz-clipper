@@ -4,7 +4,7 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use clap::Parser;
 use std::fs::File as StdFile;
-use std::io::{Read};
+use std::io::Read;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use async_zip::tokio::write::ZipFileWriter;
@@ -132,19 +132,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     
-    // Setup Client Config
+    // Setup Client Config with robust unsigned & Path-Style parameters
     let s3_client = if args.no_sign_request {
         if args.debug {
             println!("[DEBUG] Using anonymous S3 client (no-sign-request).");
         }
-        // Create an S3 Config Builder from standard defaults
         let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config);
         
-        // FIX: Force set credentials provider to None to omit "Authorization" headers
+        // 1. Force the credentials provider to None to omit all Authorization headers
         s3_config_builder.set_credentials_provider(None);
         
+        // 2. Build S3 configuration forcing path style and regional routing
         let s3_config = s3_config_builder
             .region(Region::new("us-east-1")) // Force us-east-1 region for public bucket
+            .force_path_style(true)          // Force path-style access
             .build();
             
         aws_sdk_s3::Client::from_conf(s3_config)

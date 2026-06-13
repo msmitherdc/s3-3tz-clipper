@@ -74,4 +74,4 @@ unzip -l clipped-jacksonville.3tz | head -n 25
 echo "==========================================="
 echo "✅ SUCCESS: Clipped, decompressed, and indexed s3://$BUCKET/$KEY!"
 echo "==========================================="
-```We’re currently experiencing high demand. Retry in a few minutes.
+
