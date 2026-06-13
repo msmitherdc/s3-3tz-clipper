@@ -9,7 +9,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  AWS_REGION: "us-east-1" # Change if your bucket is in a different region
+  AWS_ACCESS_KEY_ID: ""
+  AWS_SECRET_ACCESS_KEY: ""
+  AWS_SESSION_TOKEN: ""
+  AWS_DEFAULT_REGION: "us-east-1"
 
 jobs:
   test-s3-clipper:
