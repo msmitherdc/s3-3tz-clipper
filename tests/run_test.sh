@@ -35,12 +35,12 @@ EOF
 echo "==========================================="
 echo "2. Compiling Rust S3 3tz Clipper"
 echo "==========================================="
-cargo build --release --target aarch64-apple-darwin
+cargo build --release --target x86_64-unknown-linux-musl
 
 echo "==========================================="
 echo "3. Clipping S3 Dataset (s3://$BUCKET/$KEY)"
 echo "==========================================="
-./target/aarch64-apple-darwin/release/s3-3tz-clipper \
+./target/x86_64-unknown-linux-musl/release/s3-3tz-clipper \
   --bucket "$BUCKET" \
   --key "$KEY" \
   --geojson "jacksonville_clip.geojson" \
