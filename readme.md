@@ -31,7 +31,7 @@ This environment is can be instantiated vai via `mamba` / `conda-forge`.
 Install the Rust compiler and package manager (`cargo`) from `conda-forge`. To cross-compile for an AMD64 Linux target from a macOS Apple Silicon host, install the pre-compiled standard library package for `gnu` Linux.
 Install `zig` (used as the cross-linker) and `cargo-zigbuild`:
 ```bash
-mamba install -c conda-forge rust rust-std-x86_64-unknown-linux-gnu zig cargo-zigbuild
+mamba install -c conda-forge rust rust-std-x86_64-unknown-linux-gnu cargo-zigbuild 
 ```
 ---
 
