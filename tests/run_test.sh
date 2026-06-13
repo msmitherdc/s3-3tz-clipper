@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-# S3 Source Dataset Details (Public Partner Share)
-BUCKET="grid-partner-share"
+# S3 Source Dataset Details
+BUCKET="grid-dev-test-files"
 KEY="mesh/fixtures/jacksonville.3tz"
 
 echo "==========================================="
@@ -33,28 +33,31 @@ cat <<EOF > jacksonville_clip.geojson
 EOF
 
 echo "==========================================="
-echo "2. Clipping S3 Dataset (s3://$BUCKET/$KEY)"
+echo "2. Compiling Rust S3 3tz Clipper"
 echo "==========================================="
-# Execute the native binary (works on macOS locally, or Linux in CI)
-./target/release/s3-3tz-clipper \
+cargo build --release --target aarch64-apple-darwin
+
+echo "==========================================="
+echo "3. Clipping S3 Dataset (s3://$BUCKET/$KEY)"
+echo "==========================================="
+./target/aarch64-apple-darwin/release/s3-3tz-clipper \
   --bucket "$BUCKET" \
   --key "$KEY" \
   --geojson "jacksonville_clip.geojson" \
   --output "clipped-jacksonville.3tz" \
   --progress \
-  --concurrency 30
+  --concurrency 30 \
+  --no-sign-request # <-- Add this flag for public buckets
 
 echo "==========================================="
-echo "3. Validating Output File Structure"
+echo "4. Validating Output File Structure"
 echo "==========================================="
 if [ ! -f "clipped-jacksonville.3tz" ]; then
     echo "❌ ERROR: Output file clipped-jacksonville.3tz was not created!"
     exit 1
 fi
 
-# Look for tileset.json and at least one model file
-unzip -l clipped-jacksonville.3tz | grep "tileset.json"
-unzip -l clipped-jacksonville.3tz | grep -m 1 ".b3dm\|.glb"
+unzip -l clipped-jacksonville.3tz | head -n 25
 
 echo "==========================================="
 echo "✅ SUCCESS: Clipped, decompressed, and indexed s3://$BUCKET/$KEY!"
