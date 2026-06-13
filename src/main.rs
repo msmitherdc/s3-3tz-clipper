@@ -1,11 +1,9 @@
 mod clip;
 
-use tracing_subscriber::EnvFilter;
 use aws_config::BehaviorVersion;
-use aws_sdk_s3::config::Region;
 use clap::Parser;
 use std::fs::File as StdFile;
-use std::io::Read;
+use std::io::{Read};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use async_zip::tokio::write::ZipFileWriter;
@@ -39,6 +37,59 @@ struct CdEntry {
     is_deflated: bool,
 }
 
+// Thread-safe wrapper allowing us to use either the S3 SDK or Reqwest
+#[derive(Clone)]
+enum S3Client {
+    Signed(aws_sdk_s3::Client),
+    Unsigned(reqwest::Client),
+}
+
+impl S3Client {
+    async fn fetch_size(&self, bucket: &str, key: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            S3Client::Signed(client) => {
+                let head = client.head_object().bucket(bucket).key(key).send().await?;
+                Ok(head.content_length().unwrap_or(0) as u64)
+            }
+            S3Client::Unsigned(client) => {
+                let url = format!("https://{}.s3.amazonaws.com/{}", bucket, key);
+                let resp = client.head(&url).send().await?;
+                let len = resp.headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .ok_or("No content-length header")?
+                    .to_str()?
+                    .parse::<u64>()?;
+                Ok(len)
+            }
+        }
+    }
+
+    async fn fetch_range(&self, bucket: &str, key: &str, start: u64, end: u64) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            S3Client::Signed(client) => {
+                let resp = client.get_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .range(format!("bytes={}-{}", start, end))
+                    .send()
+                    .await?;
+                Ok(resp.body.collect().await?.into_bytes().to_vec())
+            }
+            S3Client::Unsigned(client) => {
+                let url = format!("https://{}.s3.amazonaws.com/{}", bucket, key);
+                let resp = client.get(&url)
+                    .header(reqwest::header::RANGE, format!("bytes={}-{}", start, end))
+                    .send()
+                    .await?;
+                if !resp.status().is_success() {
+                    return Err(format!("HTTP Error: {}", resp.status()).into());
+                }
+                Ok(resp.bytes().await?.to_vec())
+            }
+        }
+    }
+}
+
 fn resolve_uri(base: &str, uri: &str) -> String {
     let clean_uri = if uri.starts_with("./") { &uri[2..] } else { uri };
     if clean_uri.starts_with('/') { return clean_uri[1..].to_string(); }
@@ -59,24 +110,19 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
     let mut entries = Vec::new();
     let mut curr = 0;
     let len = cd_bytes.len();
-
     while curr + 46 <= len {
         if &cd_bytes[curr..curr+4] != &[0x50, 0x4b, 0x01, 0x02] {
             break;
         }
-
         let comp_method = u16::from_le_bytes(cd_bytes[curr+10..curr+12].try_into().unwrap());
         let is_deflated = comp_method == 8;
-
         let mut comp_size = u32::from_le_bytes(cd_bytes[curr+20..curr+24].try_into().unwrap()) as u64;
         let mut uncomp_size = u32::from_le_bytes(cd_bytes[curr+24..curr+28].try_into().unwrap()) as u64;
         let name_len = u16::from_le_bytes(cd_bytes[curr+28..curr+30].try_into().unwrap()) as usize;
         let extra_len = u16::from_le_bytes(cd_bytes[curr+30..curr+32].try_into().unwrap()) as usize;
         let comment_len = u16::from_le_bytes(cd_bytes[curr+32..curr+34].try_into().unwrap()) as usize;
         let mut header_offset = u32::from_le_bytes(cd_bytes[curr+42..curr+46].try_into().unwrap()) as u64;
-
         let filename = std::str::from_utf8(&cd_bytes[curr+46..curr+46+name_len]).unwrap_or("").to_string();
-
         if extra_len > 0 && (uncomp_size == 0xFFFFFFFF || comp_size == 0xFFFFFFFF || header_offset == 0xFFFFFFFF) {
             let extra_start = curr + 46 + name_len;
             let extra_end = extra_start + extra_len;
@@ -101,82 +147,43 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
                 ptr += 4 + sz;
             }
         }
-
-        entries.push(CdEntry {
-            filename,
-            header_offset,
-            compressed_size: comp_size,
-            is_deflated,
-        });
-
+        entries.push(CdEntry { filename, header_offset, compressed_size: comp_size, is_deflated });
         curr += 46 + name_len + extra_len + comment_len;
     }
     entries
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+// FIX: Changed main return error type to be Send + Sync
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
-    
-    // Initialize standard AWS logging if debug is enabled
-    if args.debug {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("aws_config=debug,aws_sdk_s3=debug,hyper=debug"))
-            )
-            .init();
-        println!("[DEBUG] Diagnostic Tracing logger initialized.");
-    }
     
     let mut geojson_str = String::new();
     if args.geojson == "-" {
-        if args.debug {
-            println!("Reading GeoJSON clipping boundary from standard input (stdin)...");
-        }
         std::io::stdin().read_to_string(&mut geojson_str)?;
     } else {
         let mut geojson_file = StdFile::open(&args.geojson)?;
         geojson_file.read_to_string(&mut geojson_str)?;
     }
-    
     let clip_polygon = clip::parse_geojson_polygon(&geojson_str).expect("Failed to parse GeoJSON");
 
-    let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-    
-    // Setup Client Config with robust unsigned & Path-Style parameters
     let s3_client = if args.no_sign_request {
-        if args.debug {
-            println!("[DEBUG] Using anonymous S3 client (no-sign-request).");
-        }
-        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config);
-        
-        // 1. Force the credentials provider to None to omit all Authorization headers
-        s3_config_builder.set_credentials_provider(None);
-        
-        // 2. Build S3 configuration forcing path style and regional routing
-        let s3_config = s3_config_builder
-            .region(Region::new("us-east-1")) // Force us-east-1 region for public bucket
-            .force_path_style(true)          // Force path-style access
-            .build();
-            
-        aws_sdk_s3::Client::from_conf(s3_config)
+        if args.debug { println!("[DEBUG] Using anonymous reqwest client (no-sign-request)."); }
+        S3Client::Unsigned(reqwest::Client::new())
     } else {
-        aws_sdk_s3::Client::new(&config)
+        if args.debug { println!("[DEBUG] Using standard authenticated AWS S3 client."); }
+        let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+        S3Client::Signed(aws_sdk_s3::Client::new(&config))
     };
 
-    if args.debug {
-        println!("Connecting to s3://{}/{}...", args.bucket, args.key);
-    }
-
-    let head = s3_client.head_object().bucket(&args.bucket).key(&args.key).send().await?;
-    let file_size = head.content_length().expect("Missing content-length") as u64;
-
+    if args.debug { println!("Connecting to s3://{}/{}...", args.bucket, args.key); }
+    
+    // FIX: Renamed get_size -> fetch_size
+    let file_size = s3_client.fetch_size(&args.bucket, &args.key).await?;
     let eocd_read_size = std::cmp::min(file_size, 65536);
     let eocd_start = file_size - eocd_read_size;
-    let resp = s3_client.get_object().bucket(&args.bucket).key(&args.key)
-        .range(format!("bytes={}-{}", eocd_start, file_size - 1)).send().await?;
-    let eocd_bytes = resp.body.collect().await?.into_bytes().to_vec();
+    // FIX: Renamed get_range -> fetch_range
+    let eocd_bytes = s3_client.fetch_range(&args.bucket, &args.key, eocd_start, file_size - 1).await?;
 
     let mut cd_offset = 0;
     let mut cd_size = 0;
@@ -187,13 +194,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
     }
-
-    for i in (0..eocd_bytes.len().saturating_sub(20)).rev() {
+     for i in (0..eocd_bytes.len().saturating_sub(20)).rev() {
         if &eocd_bytes[i..i+4] == &[0x50, 0x4b, 0x06, 0x07] {
             let zip64_eocd_offset = u64::from_le_bytes(eocd_bytes[i+8..i+16].try_into().unwrap());
-            let resp = s3_client.get_object().bucket(&args.bucket).key(&args.key)
-                .range(format!("bytes={}-{}", zip64_eocd_offset, zip64_eocd_offset + 55)).send().await?;
-            let z64_bytes = resp.body.collect().await?.into_bytes();
+            // FIX: Renamed get_range -> fetch_range
+            let z64_bytes = s3_client.fetch_range(&args.bucket, &args.key, zip64_eocd_offset, zip64_eocd_offset + 55).await?;
             if &z64_bytes[0..4] == &[0x50, 0x4b, 0x06, 0x06] {
                 cd_size = u64::from_le_bytes(z64_bytes[40..48].try_into().unwrap());
                 cd_offset = u64::from_le_bytes(z64_bytes[48..56].try_into().unwrap());
@@ -202,21 +207,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if args.debug {
-        println!("[DEBUG] Fetching Central Directory from S3 ({} bytes)...", cd_size);
-    }
-
-    let resp = s3_client.get_object().bucket(&args.bucket).key(&args.key)
-        .range(format!("bytes={}-{}", cd_offset, cd_offset + cd_size - 1)).send().await?;
-    let cd_bytes = resp.body.collect().await?.into_bytes();
-
+    if args.debug { println!("[DEBUG] Fetching Central Directory ({} bytes)...", cd_size); }
+    // FIX: Renamed get_range -> fetch_range
+    let cd_bytes = s3_client.fetch_range(&args.bucket, &args.key, cd_offset, cd_offset + cd_size - 1).await?;
     let archive_entries = parse_central_directory(&cd_bytes);
+    if args.debug { println!("[DEBUG] Mapped {} file entries.", archive_entries.len()); }
 
-    if args.debug {
-        println!("[DEBUG] Mapped {} file entries from Central Directory.", archive_entries.len());
-    }
-
-    println!("Filtering tileset tree recursively...");
     let mut processed_jsons: HashMap<String, serde_json::Value> = HashMap::new();
     let mut keep_uris: HashSet<String> = HashSet::new();
     let mut queue: Vec<String> = vec!["tileset.json".to_string()];
@@ -225,18 +221,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(current_json_path) = queue.pop() {
         let entry = match archive_entries.iter().find(|e| e.filename == current_json_path) {
             Some(e) => e,
-            None => { println!("[Warn] Missing external tileset JSON: {}", current_json_path); continue; }
+            None => { println!("[Warn] Missing JSON: {}", current_json_path); continue; }
         };
 
-        let lfh_resp = s3_client.get_object().bucket(&args.bucket).key(&args.key)
-            .range(format!("bytes={}-{}", entry.header_offset, entry.header_offset + 30 + entry.filename.len() as u64 + 128)).send().await?;
-        let lfh_bytes = lfh_resp.body.collect().await?.into_bytes();
+        // FIX: Renamed get_range -> fetch_range
+        let lfh_bytes = s3_client.fetch_range(&args.bucket, &args.key, entry.header_offset, entry.header_offset + 30 + entry.filename.len() as u64 + 128).await?;
         let lfh_extra_len = u16::from_le_bytes(lfh_bytes[28..30].try_into().unwrap()) as u64;
         let payload_offset = entry.header_offset + 30 + entry.filename.len() as u64 + lfh_extra_len;
 
-        let resp = s3_client.get_object().bucket(&args.bucket).key(&args.key)
-            .range(format!("bytes={}-{}", payload_offset, payload_offset + entry.compressed_size - 1)).send().await?;
-        let compressed_bytes = resp.body.collect().await?.into_bytes();
+        // FIX: Renamed get_range -> fetch_range
+        let compressed_bytes = s3_client.fetch_range(&args.bucket, &args.key, payload_offset, payload_offset + entry.compressed_size - 1).await?;
 
         let mut json_bytes = Vec::new();
         if entry.is_deflated {
@@ -254,15 +248,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for uri in local_uris {
             let resolved = resolve_uri(&current_json_path, &uri);
             if !keep_uris.contains(&resolved) {
-                if resolved.ends_with(".json") {
-                    queue.push(resolved.clone());
-                }
+                if resolved.ends_with(".json") { queue.push(resolved.clone()); }
                 keep_uris.insert(resolved);
             }
         }
     }
-
-    println!("Found {} files that intersect the polygon. Commencing multithreaded extraction...", keep_uris.len());
+    
+    println!("Found {} files to download. Commencing extraction...", keep_uris.len());
     let out_file = AsyncFile::create(&args.output).await?;
     let mut zip_writer = ZipFileWriter::new(out_file.compat_write());
 
@@ -276,15 +268,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, mut rx) = mpsc::channel::<DownloadedFile>(args.concurrency * 2);
     let mut fetch_tasks = Vec::new();
 
+    let s3_client_shared = Arc::new(s3_client);
+
     for entry in &archive_entries {
         if keep_uris.contains(&entry.filename) {
             let filename = entry.filename.clone();
             if let Some(clipped_json) = processed_jsons.get(&filename) {
                 let data = serde_json::to_string(clipped_json)?.into_bytes();
                 let tx_clone = tx.clone();
-                let task = tokio::spawn(async move {
-                    let _ = tx_clone.send(DownloadedFile { filename, data }).await;
-                });
+                let task = tokio::spawn(async move { let _ = tx_clone.send(DownloadedFile { filename, data }).await; });
                 fetch_tasks.push(task);
                 continue;
             }
@@ -297,66 +289,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let semaphore_clone = semaphore.clone();
             let tx_clone = tx.clone();
             let pb_clone = pb.clone();
-            let client_clone = s3_client.clone();
+            let client_clone = s3_client_shared.clone();
             let bucket_clone = args.bucket.clone();
             let key_clone = args.key.clone();
             let target_filename = filename.clone();
 
             let task = tokio::spawn(async move {
                 let _permit = semaphore_clone.acquire_owned().await.unwrap();
-                
                 if let Some(ref bar) = pb_clone { bar.set_message(format!("Fetching {}", target_filename)); }
                 
                 let range_end = header_offset + 30 + filename_len as u64 + 256 + compressed_size;
-                
-                let resp = match client_clone.get_object()
-                    .bucket(bucket_clone)
-                    .key(key_clone)
-                    .range(format!("bytes={}-{}", header_offset, range_end))
-                    .send().await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            eprintln!("\n[ERROR] S3 range request failed for '{}': {:?}", target_filename, e);
-                            return;
-                        }
-                    };
-                
-                let bytes = match resp.body.collect().await {
-                    Ok(b) => b.into_bytes().to_vec(),
-                    Err(e) => {
-                        eprintln!("\n[ERROR] Byte streaming failed for '{}': {:?}", target_filename, e);
-                        return;
-                    }
+                // FIX: Renamed get_range -> fetch_range
+                let bytes = match client_clone.fetch_range(&bucket_clone, &key_clone, header_offset, range_end).await {
+                    Ok(b) => b,
+                    Err(e) => { eprintln!("\n[ERROR] Fetch failed for '{}': {:?}", target_filename, e); return; }
                 };
 
-                if bytes.len() < 30 {
-                    eprintln!("\n[ERROR] local header too small ({} bytes) for '{}'", bytes.len(), target_filename);
-                    return;
-                }
-
+                if bytes.len() < 30 { return; }
                 let lfh_extra_len = u16::from_le_bytes(bytes[28..30].try_into().unwrap()) as usize;
                 let payload_start = 30 + filename_len + lfh_extra_len;
-                
-                if bytes.len() < payload_start + compressed_size as usize {
-                    eprintln!("\n[ERROR] Payload truncated for '{}'. Expected at least {} bytes, got {} bytes.", target_filename, payload_start + compressed_size as usize, bytes.len());
-                    return;
-                }
+                if bytes.len() < payload_start + compressed_size as usize { return; }
 
                 let compressed_data = &bytes[payload_start..payload_start + compressed_size as usize];
-
                 let mut data = Vec::new();
                 if is_deflated {
                     let mut decoder = DeflateDecoder::new(compressed_data);
-                    if let Err(e) = decoder.read_to_end(&mut data) {
-                        eprintln!("\n[ERROR] Decompression failed for '{}': {:?}", target_filename, e);
-                        return;
-                    }
+                    decoder.read_to_end(&mut data).unwrap();
                 } else {
                     data.extend_from_slice(compressed_data);
                 }
                 
                 if let Err(e) = tx_clone.send(DownloadedFile { filename: target_filename, data }).await {
-                    eprintln!("\n[ERROR] Channel send failed for '{}': {}", filename, e);
+                    eprintln!("\n[ERROR] Channel send failed: {}", e);
                 }
             });
             fetch_tasks.push(task);
@@ -364,13 +328,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     drop(tx);
-
     while let Some(file) = rx.recv().await {
         let builder = ZipEntryBuilder::new(file.filename.clone().into(), Compression::Deflate);
         zip_writer.write_entry_whole(builder, &file.data).await.unwrap();
         if let Some(ref bar) = pb { bar.inc(1); }
     }
-
     for task in fetch_tasks {
         task.await.unwrap();
     }
