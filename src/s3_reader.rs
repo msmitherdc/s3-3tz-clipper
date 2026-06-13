@@ -30,8 +30,7 @@ impl AsyncSeek for S3SeekableReader {
             SeekFrom::End(p) => self.pos = (self.size as i64 + p) as u64,
             SeekFrom::Current(p) => self.pos = (self.pos as i64 + p) as u64,
         }
-        
-        // Invalidate any pending read since we shifted focus
+
         self.pending_read = None;
         Ok(())
     }
@@ -58,7 +57,6 @@ impl AsyncRead for S3SeekableReader {
             let key = self.key.clone();
             let start = self.pos;
             
-            // Underflow & Overflow Safe Bound Calculation
             let end = if start + remaining >= self.size {
                 self.size - 1
             } else {

@@ -10,7 +10,7 @@ pub fn parse_geojson_polygon(geojson_str: &str) -> Option<Polygon<f64>> {
     let geojson = geojson_str.parse::<GeoJson>().ok()?;
     
     match geojson {
-        // 1. Handle FeatureCollections (Common GIS exports)
+        // Handle FeatureCollections
         GeoJson::FeatureCollection(collection) => {
             for feature in collection.features {
                 if let Some(geometry) = feature.geometry {
@@ -21,7 +21,7 @@ pub fn parse_geojson_polygon(geojson_str: &str) -> Option<Polygon<f64>> {
             }
             None
         }
-        // 2. Handle a solitary Feature
+        // Handle a solitary Feature
         GeoJson::Feature(feature) => {
             if let Some(geometry) = feature.geometry {
                 if let Value::Polygon(poly) = geometry.value {
@@ -30,7 +30,7 @@ pub fn parse_geojson_polygon(geojson_str: &str) -> Option<Polygon<f64>> {
             }
             None
         }
-        // 3. Handle a raw Geometry object
+        // Handle a raw Geometry object
         GeoJson::Geometry(geometry) => {
             if let Value::Polygon(poly) = geometry.value {
                 return Polygon::try_from(Value::Polygon(poly)).ok();
@@ -50,7 +50,7 @@ pub fn tile_intersects(tile: &JsonValue, polygon: &Polygon<f64>) -> bool {
         None => return false,
     };
 
-    // Case 1: S2 Cell Bounding Volume
+    // handle S2 Cell Bounding Volume
     if let Some(extensions) = bounding_volume.get("extensions") {
         if let Some(s2_ext) = extensions.get("3DTILES_bounding_volume_S2") {
             if let Some(token) = s2_ext.get("token").and_then(|t| t.as_str()) {
@@ -74,7 +74,7 @@ pub fn tile_intersects(tile: &JsonValue, polygon: &Polygon<f64>) -> bool {
         }
     }
 
-    // Case 2: Bounding Volume is a Region
+    // CBounding Volume is a Region
     if let Some(region) = bounding_volume.get("region").and_then(|r| r.as_array()) {
         if region.len() >= 4 {
             let west = rad_to_deg(region[0].as_f64().unwrap_or(0.0));
@@ -90,7 +90,7 @@ pub fn tile_intersects(tile: &JsonValue, polygon: &Polygon<f64>) -> bool {
         }
     }
 
-    // Case 3: Box Fallback
+    // Box Fallback
     if bounding_volume.get("box").and_then(|b| b.as_array()).is_some() {
         return true;
     }
