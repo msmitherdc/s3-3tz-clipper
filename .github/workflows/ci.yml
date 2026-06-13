@@ -1,0 +1,67 @@
+name: CI / Integration Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: # Allows manual triggering from the GitHub UI
+
+env:
+  CARGO_TERM_COLOR: always
+  AWS_REGION: "us-east-1" # Change if your bucket is in a different region
+
+jobs:
+  test-s3-clipper:
+    name: Build & Test (Linux amd64)
+    runs-on: ubuntu-latest
+    
+    # We need permission to ask GitHub to mint an OIDC token for AWS
+    permissions:
+      id-token: write 
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      # Caching speeds up subsequent builds
+      - name: Cache Cargo Registry & Build Output
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # (Option A) If the bucket is completely public and allows anonymous reads:
+      # You can disable authentication entirely in the aws-sdk by running without credentials.
+      # However, aws-sdk-s3 usually requires at least dummy credentials.
+      - name: Configure Dummy AWS Credentials (For Public Bucket)
+        run: |
+          echo "AWS_ACCESS_KEY_ID=test" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=test" >> $GITHUB_ENV
+
+      # (Option B) If the bucket requires authentication:
+      # Uncomment the step below and configure an OIDC provider in AWS IAM.
+      # - name: Configure AWS Credentials via OIDC
+      #   uses: aws-actions/configure-aws-credentials@v4
+      #   with:
+      #     role-to-assume: arn:aws:iam::123456789012:role/MyGitHubActionsRole
+      #     aws-region: ${{ env.AWS_REGION }}
+
+      - name: Compile Application
+        run: cargo build --release
+
+      - name: Run E2E Integration Test Script
+        run: |
+          chmod +x run_test.sh
+          ./run_test.sh
