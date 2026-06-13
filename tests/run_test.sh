@@ -58,7 +58,8 @@ $BINARY \
   --geojson "jacksonville_clip.geojson" \
   --output "clipped-jacksonville.3tz" \
   --progress \
-  --concurrency 30 \
+  --concurrency 10 \
+  --debug \
   $NO_SIGN_REQUEST
 
 echo "==========================================="
