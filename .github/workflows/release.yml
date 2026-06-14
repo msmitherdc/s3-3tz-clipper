@@ -9,61 +9,98 @@ permissions:
 
 jobs:
   build-and-upload:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.asset_name }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          # Linux AMD64
+          # Linux AMD64 - Highly Compatible Dynamic Glibc (RHEL 8+)
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            rustup_target: x86_64-unknown-linux-gnu
+            build_target: x86_64-unknown-linux-gnu.2.28
+            use_zigbuild: true
+            needs_musl: false
             artifact_name: s3-3tz-clipper
-            asset_name: s3-3tz-clipper-linux-amd64.tar.gz
+            asset_name: s3-3tz-clipper-linux-amd64-glibc.tar.gz
+
+          # Linux AMD64 - Fully Static Musl
+          - os: ubuntu-latest
+            rustup_target: x86_64-unknown-linux-musl
+            build_target: x86_64-unknown-linux-musl
+            use_zigbuild: true
+            needs_musl: true
+            artifact_name: s3-3tz-clipper
+            asset_name: s3-3tz-clipper-linux-amd64-musl.tar.gz
 
           # macOS Apple Silicon (M1/M2/M3/M4)
           - os: macos-latest
-            target: aarch64-apple-darwin
+            rustup_target: aarch64-apple-darwin
+            build_target: aarch64-apple-darwin
+            use_zigbuild: false
+            needs_musl: false
             artifact_name: s3-3tz-clipper
             asset_name: s3-3tz-clipper-macos-arm64.tar.gz
 
           # Windows Intel/AMD 64-bit
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
+            rustup_target: x86_64-pc-windows-msvc
+            build_target: x86_64-pc-windows-msvc
+            use_zigbuild: false
+            needs_musl: false
             artifact_name: s3-3tz-clipper.exe
             asset_name: s3-3tz-clipper-windows-amd64.zip
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-    - name: Install Rust Toolchain
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: ${{ matrix.target }}
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rustup_target }}
 
-    - name: Rust Cache
-      uses: Swatinem/rust-cache@v2
-      with:
-        key: ${{ matrix.target }}
+      # Conditionally install musl-tools for the static Linux build
+      - name: Install musl-tools
+        if: matrix.needs_musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-    - name: Build Binary
-      run: cargo build --release --target ${{ matrix.target }}
+      # Conditionally install Zig and cargo-zigbuild for the glibc build
+      - name: Install zig and cargo-zigbuild
+        if: matrix.use_zigbuild
+        run: |
+          pip3 install ziglang
+          cargo install cargo-zigbuild
 
-    # Cross-platform packaging step
-    - name: Package Binary
-      shell: bash
-      run: |
-        cd target/${{ matrix.target }}/release
-        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-          7z a ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
-        else
-          tar -czf ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
-        fi
-        cd ../../../
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.build_target }}
 
-    - name: Upload Release Asset
-      uses: softprops/action-gh-release@v2
-      with:
-        files: ${{ matrix.asset_name }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Run standard cargo build for macOS, Windows, and Linux musl
+      - name: Build Binary (Standard)
+        if: matrix.use_zigbuild == false
+        run: cargo build --release --target ${{ matrix.build_target }}
+
+      # Run cargo-zigbuild for the highly compatible Linux glibc target
+      - name: Build Binary (Zigbuild)
+        if: matrix.use_zigbuild == true
+        run: cargo zigbuild --release --target ${{ matrix.build_target }}
+
+      # Cross-platform packaging step
+      - name: Package Binary
+        shell: bash
+        run: |
+          cd target/${{ matrix.build_target }}/release
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            7z a ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
+          else
+            tar -czf ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
+          fi
+          cd ../../../
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
