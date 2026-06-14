@@ -97,3 +97,16 @@ cat ~/myboundary.geojson | ./target/release/s3-3tz-clipper \
 ```
 
 ---
+## 💡 Environment
+
+### To configure for custom certificate bundles, use:
+```
+CUSTOM_CA_BUNDLE=/path/to/enterprise-ca.pem  
+AWS_CA_BUNDLE=/path/to/enterprise-ca.pem
+``` 
+both the reqwest anonymous client and the standard aws-sdk-s3 client will automatically mount the custom TLS certificates 
+
+### To configure for a custom s3 endpoint use:
+```bash
+AWS_S3_ENDPOINT=/path/to/custom/aws-s3-endpoint
+```
