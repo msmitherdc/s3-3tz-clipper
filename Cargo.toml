@@ -12,7 +12,7 @@ aws-sdk-s3 = { version = "1.135.0", default-features = false, features = ["rustl
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = "0.22"
 rustls-pemfile = "2.1"
-async_zip = { version = "0.0.17", features = ["tokio", "deflate"] }
+async_zip = { version = "0.0.18", features = ["tokio", "deflate"] }
 geojson = "0.24"
 geo = "0.27"
 geo-types = "0.7"
