@@ -9,64 +9,59 @@ permissions:
 
 jobs:
   build-and-upload:
-    name: Build ${{ matrix.asset_name }}
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          # Linux AMD64 - Highly Compatible Dynamic Glibc (RHEL 8+)
+          # --- Linux Builds ---
+          # 1. Glibc build using zigbuild for RHEL 8+ compatibility
           - os: ubuntu-latest
-            rustup_target: x86_64-unknown-linux-gnu
-            build_target: x86_64-unknown-linux-gnu.2.28
-            use_zigbuild: true
-            needs_musl: false
+            target: x86_64-unknown-linux-gnu.2.28 # Zigbuild target
             artifact_name: s3-3tz-clipper
             asset_name: s3-3tz-clipper-linux-amd64-glibc.tar.gz
+            use_zig: true # Custom flag to enable zigbuild step
 
-          # Linux AMD64 - Fully Static Musl
+          # 2. Musl build for a fully static binary
           - os: ubuntu-latest
-            rustup_target: x86_64-unknown-linux-musl
-            build_target: x86_64-unknown-linux-musl
-            use_zigbuild: true
-            needs_musl: true
+            target: x86_64-unknown-linux-musl # Musl target
             artifact_name: s3-3tz-clipper
             asset_name: s3-3tz-clipper-linux-amd64-musl.tar.gz
+            use_zig: false # Regular build
 
+          # --- Other OS ---
           # macOS Apple Silicon (M1/M2/M3/M4)
           - os: macos-latest
-            rustup_target: aarch64-apple-darwin
-            build_target: aarch64-apple-darwin
-            use_zigbuild: false
-            needs_musl: false
+            target: aarch64-apple-darwin
             artifact_name: s3-3tz-clipper
             asset_name: s3-3tz-clipper-macos-arm64.tar.gz
+            use_zig: false
 
           # Windows Intel/AMD 64-bit
           - os: windows-latest
-            rustup_target: x86_64-pc-windows-msvc
-            build_target: x86_64-pc-windows-msvc
-            use_zigbuild: false
-            needs_musl: false
+            target: x86_64-pc-windows-msvc
             artifact_name: s3-3tz-clipper.exe
             asset_name: s3-3tz-clipper-windows-amd64.zip
+            use_zig: false
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      # This target is now derived from the matrix.target by stripping the zig suffix
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.rustup_target }}
+          targets: ${{ split(matrix.target, '.')[0] }}
 
-      # Conditionally install musl-tools for the static Linux build
+      # Install musl-tools only when the target contains 'musl'
       - name: Install musl-tools
-        if: matrix.needs_musl
+        if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      # Conditionally install Zig and cargo-zigbuild for the glibc build
+      # Install ziglang tools only when the custom 'use_zig' flag is true
       - name: Install zig and cargo-zigbuild
-        if: matrix.use_zigbuild
+        if: matrix.use_zig
         run: |
           pip3 install ziglang
           cargo install cargo-zigbuild
@@ -74,23 +69,22 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.build_target }}
+          key: ${{ matrix.target }}
 
-      # Run standard cargo build for macOS, Windows, and Linux musl
-      - name: Build Binary (Standard)
-        if: matrix.use_zigbuild == false
-        run: cargo build --release --target ${{ matrix.build_target }}
+      # Build with zigbuild for the glibc target, otherwise use standard cargo build
+      - name: Build Binary
+        run: |
+          if [[ "${{ matrix.use_zig }}" == "true" ]]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
-      # Run cargo-zigbuild for the highly compatible Linux glibc target
-      - name: Build Binary (Zigbuild)
-        if: matrix.use_zigbuild == true
-        run: cargo zigbuild --release --target ${{ matrix.build_target }}
-
-      # Cross-platform packaging step
       - name: Package Binary
         shell: bash
         run: |
-          cd target/${{ matrix.build_target }}/release
+          # The output directory is the full target string from the matrix
+          cd target/${{ matrix.target }}/release
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             7z a ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
           else
