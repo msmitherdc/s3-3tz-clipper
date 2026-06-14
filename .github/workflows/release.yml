@@ -7,7 +7,6 @@ on:
     inputs:
       tag_name:
         description: 'Target release tag to compile and upload binaries'
-        
         required: true
 permissions:
   contents: write # Required to upload assets to the release page
@@ -20,29 +19,25 @@ jobs:
       matrix:
         include:
           # --- Linux Builds ---
-          # 1. Glibc build using zigbuild for RHEL 8+ compatibility
           - os: ubuntu-latest
-            rustup_target: x86_64-unknown-linux-gnu      # Base target for rustup
-            build_target: x86_64-unknown-linux-gnu.2.28 # Specific target for zigbuild
+            rustup_target: x86_64-unknown-linux-gnu
+            build_target: x86_64-unknown-linux-gnu.2.28
             artifact_name: s3-3tz-clipper
             asset_name: s3-3tz-clipper-linux-amd64-glibc.tar.gz
 
-          # 2. Musl build for a fully static binary
           - os: ubuntu-latest
-            rustup_target: x86_64-unknown-linux-musl      # Base target for rustup
-            build_target: x86_64-unknown-linux-musl       # Build target is the same
+            rustup_target: x86_64-unknown-linux-musl
+            build_target: x86_64-unknown-linux-musl
             artifact_name: s3-3tz-clipper
             asset_name: s3-3tz-clipper-linux-amd64-musl.tar.gz
 
           # --- Other OS ---
-          # macOS Apple Silicon
           - os: macos-latest
             rustup_target: aarch64-apple-darwin
             build_target: aarch64-apple-darwin
             artifact_name: s3-3tz-clipper
             asset_name: s3-3tz-clipper-macos-arm64.tar.gz
 
-          # Windows AMD64
           - os: windows-latest
             rustup_target: x86_64-pc-windows-msvc
             build_target: x86_64-pc-windows-msvc
@@ -58,12 +53,10 @@ jobs:
         with:
           targets: ${{ matrix.rustup_target }}
 
-      # Install musl-tools only when the target contains 'musl'
       - name: Install musl-tools
         if: contains(matrix.build_target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      # Install ziglang tools only for the zigbuild target
       - name: Install zig and cargo-zigbuild
         if: contains(matrix.build_target, '.2.28')
         run: |
@@ -76,6 +69,7 @@ jobs:
           key: ${{ matrix.build_target }}
 
       - name: Build Binary
+        shell: bash
         run: |
           if [[ "${{ contains(matrix.build_target, '.2.28') }}" == "true" ]]; then
             cargo zigbuild --release --target ${{ matrix.build_target }}
@@ -86,7 +80,6 @@ jobs:
       - name: Package Binary
         shell: bash
         run: |
-          # The output directory is the full build_target string
           cd target/${{ matrix.build_target }}/release
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             7z a ../../../${{ matrix.asset_name }} ${{ matrix.artifact_name }}
