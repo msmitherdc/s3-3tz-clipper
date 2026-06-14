@@ -91,7 +91,8 @@ jobs:
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }} # <--- ADD THIS LINE
+          # Use automated release tag, OR fallback to the manual workflow_dispatch input
+          tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag_name }} 
           files: ${{ matrix.asset_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
