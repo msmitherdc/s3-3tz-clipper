@@ -3,7 +3,12 @@ name: Publish Rust Release Binaries
 on:
   release:
     types: [published] # Triggers when you create and publish a release on GitHub
-
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Target release tag to compile and upload binaries'
+        
+        required: true
 permissions:
   contents: write # Required to upload assets to the release page
 
