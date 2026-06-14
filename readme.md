@@ -1,6 +1,6 @@
 
 # S3 3tz Clipper 🛰️
-### Cloud-Optimized, Multi-Threaded 3D Tiles Clipping Tool
+### Cloud-Optimized, Multi-Threaded 3D Tiles with 3tz index Clipping Tool
 
 `s3-3tz-clipper` is a Rust-based command-line interface (CLI) for clipping 3D Tiles (`.3tz`) archives directly over S3. Operating on any size dataset, it requires **zero local storage overhead** for the source file, using  HTTP range requests to stream only the required tiles based on a GeoJSON polygon.
 

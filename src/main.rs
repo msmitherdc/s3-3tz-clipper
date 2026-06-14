@@ -12,14 +12,13 @@ use tokio::fs::File as AsyncFile;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use md5::{Md5, Digest};
 use tokio::sync::{mpsc, Semaphore};
 use flate2::read::DeflateDecoder;
 use zip::ZipArchive;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Cloud-Optimized 3tz Clipper")]
+#[command(author, version, about = "Cloud-Optimized 3dtiles 3tz Clipper")]
 struct Args {
     #[arg(short, long)] bucket: String,
     #[arg(short, long)] key: String,
@@ -41,7 +40,7 @@ struct CdEntry {
 #[derive(Clone)]
 enum S3Client {
     Signed(aws_sdk_s3::Client),
-    Unsigned(reqwest::Client),
+    Unsigned(reqwest::Client, String),
 }
 
 impl S3Client {
@@ -51,8 +50,8 @@ impl S3Client {
                 let head = client.head_object().bucket(bucket).key(key).send().await?;
                 Ok(head.content_length().unwrap_or(0) as u64)
             }
-            S3Client::Unsigned(client) => {
-                let url = format!("https://s3.amazonaws.com/{}/{}", bucket, key);
+            S3Client::Unsigned(client, base_url) => {
+                let url = format!("{}/{}/{}", base_url, bucket, key);
                 let resp = client.head(&url).send().await?;
                 let len = resp.headers()
                     .get(reqwest::header::CONTENT_LENGTH)
@@ -75,14 +74,14 @@ impl S3Client {
                     .await?;
                 Ok(resp.body.collect().await?.into_bytes().to_vec())
             }
-            S3Client::Unsigned(client) => {
-                let url = format!("https://s3.amazonaws.com/{}/{}", bucket, key);
+            S3Client::Unsigned(client, base_url) => {
+                let url = format!("{}/{}/{}", base_url, bucket, key);
                 let resp = client.get(&url)
                     .header(reqwest::header::RANGE, format!("bytes={}-{}", start, end))
                     .send()
                     .await?;
                 if !resp.status().is_success() {
-                    return Err(format!("HTTP Error: {}", resp.status()).into());
+                    return Err(format!("HTTP Error: {} for url {}", resp.status(), url).into());
                 }
                 Ok(resp.bytes().await?.to_vec())
             }
@@ -158,10 +157,10 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
     entries
 }
 
-// handle custom ca bundles for other environments
+
 fn load_custom_certs() -> Option<reqwest::Certificate> {
     if let Ok(ca_path) = std::env::var("CUSTOM_CA_BUNDLE") {
-        println!("[INFO] Loading Enterprise CA Bundle from: {}", ca_path);
+        println!("[INFO] Loading custom CA Bundle from: {}", ca_path);
         if let Ok(mut buf) = StdFile::open(&ca_path) {
             let mut cert_bytes = Vec::new();
             if buf.read_to_end(&mut cert_bytes).is_ok() {
@@ -199,8 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         geojson_file.read_to_string(&mut geojson_str)?;
     }
     let clip_polygon = clip::parse_geojson_polygon(&geojson_str).expect("Failed to parse GeoJSON");
-
-    // Resolve custom S3 endpoint if specified in the environment variables
+    
     let custom_endpoint = std::env::var("AWS_S3_ENDPOINT")
         .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
         .ok();
@@ -211,7 +209,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             builder = builder.add_root_certificate(cert);
         }
         let reqwest_client = builder.build()?;
-        S3Client::Unsigned(reqwest_client)
+        
+        let base_url = custom_endpoint.unwrap_or_else(|| "https://s3.amazonaws.com".to_string());
+        if args.debug && base_url != "https://s3.amazonaws.com" {
+             println!("[DEBUG] Routing anonymous S3 requests to custom endpoint: {}", base_url);
+        }
+        
+        S3Client::Unsigned(reqwest_client, base_url)
     } else {
         let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
         let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config)
@@ -300,7 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("Found {} files that intersect. Commencing extraction...", keep_uris.len());
+    println!("Found {} files that intersect, fetching files ...", keep_uris.len());
     let out_file = AsyncFile::create(&args.output).await?;
     let mut zip_writer = ZipFileWriter::new(out_file.compat_write());
 
@@ -383,9 +387,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     zip_writer.close().await?;
     if let Some(ref bar) = pb { bar.finish_with_message("Done!"); }
 
-    println!("Patching binary index...");
+    println!("Adding 3tz index to zipfile ...");
     let mut file = tokio::fs::OpenOptions::new().read(true).write(true).open(&args.output).await?;
-    let mut final_archive = ZipArchive::new(StdFile::open(&args.output)?)?;
+    let read_file = StdFile::open(&args.output)?;
+    let mut final_archive = ZipArchive::new(read_file)?;
 
     struct IndexRecord { md5hash: [u8; 16], offset: u64 }
     let mut tzindex: Vec<IndexRecord> = Vec::new();
@@ -396,9 +401,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if file_entry.name() == "@3dtilesIndex1@" {
             index_header_offset = file_entry.header_start();
         } else {
-            let mut hasher = Md5::new();
-            hasher.update(file_entry.name().replace('\\', "/").as_bytes());
-            tzindex.push(IndexRecord { md5hash: hasher.finalize().into(), offset: file_entry.header_start() });
+            let normalized_path = file_entry.name().replace('\\', "/");
+            let digest = md5::compute(normalized_path.as_bytes());
+            tzindex.push(IndexRecord { md5hash: digest.0, offset: file_entry.header_start() });
         }
     }
     
@@ -407,7 +412,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in tzindex { bindex.extend_from_slice(&i.md5hash); bindex.extend_from_slice(&i.offset.to_le_bytes()); }
 
     let crc32 = crc32fast::hash(&bindex);
-    let index_payload_offset = final_archive.by_name("@3dtilesIndex1@")?.data_start();
+    let index_payload_offset = final_archive.by_name("@3dtilesIndex1@")?.data_start().expect("Index payload offset not found");
     
     file.seek(SeekFrom::Start(index_payload_offset)).await?;
     file.write_all(&bindex).await?;
