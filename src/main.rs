@@ -222,7 +222,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         geojson_file.read_to_string(&mut geojson_str)?;
     }
     let clip_polygon = Arc::new(clip::parse_geojson_polygon(&geojson_str).expect("Failed to parse GeoJSON"));
-    let custom_endpoint = std::env::var("AWS_S3_ENDPOINT").or_else(|_| std::env::var("AWS_ENDPOINT_URL")).ok();
+    let custom_endpoint = std::env::var("AWS_S3_ENDPOINT")
+        .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+        .map(|url| format!("https://{}", url))
+        .ok();
     let s3_client = if args.no_sign_request {
         let custom_cert = load_custom_certs()?;
         let mut builder = reqwest::Client::builder().use_rustls_tls();
