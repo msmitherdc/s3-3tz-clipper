@@ -93,29 +93,15 @@ impl S3Client {
     }
 }
 
-/// Resolve a relative URI against a base path (e.g. "a/b/tileset.json" + "../c.b3dm").
-///
-/// Security: rejects any URI whose resolved path escapes the archive root
-/// (i.e. would start with ".."), returning `None` in that case.
 fn resolve_uri(base: &str, uri: &str) -> Option<String> {
     let clean_uri = if uri.starts_with("./") { &uri[2..] } else { uri };
-
-    // Absolute paths are normalised to archive-root-relative, then validated.
-    let clean_uri = if clean_uri.starts_with('/') {
-        &clean_uri[1..]
-    } else {
-        clean_uri
-    };
-
+    let clean_uri = if clean_uri.starts_with('/') { &clean_uri[1..] } else { clean_uri };
     let mut parts: Vec<&str> = base.split('/').collect();
-    parts.pop(); // drop the filename component of the base
+    parts.pop();
     for part in clean_uri.split('/') {
         match part {
             ".." => {
-                if parts.is_empty() {
-                    // Would escape the archive root — reject.
-                    return None;
-                }
+                if parts.is_empty() { return None; }
                 parts.pop();
             }
             "." | "" => {}
@@ -130,60 +116,38 @@ struct DownloadedFile {
     data: Vec<u8>,
 }
 
-/// Decompress a deflate stream, enforcing `MAX_DECOMPRESSED_BYTES` to prevent
-/// zip-bomb attacks.
 fn decompress_deflate(compressed: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let mut decoder = DeflateDecoder::new(compressed);
     let mut buf = Vec::new();
-    decoder
-        .by_ref()
-        .take(MAX_DECOMPRESSED_BYTES)
-        .read_to_end(&mut buf)?;
-    // If we hit the limit, try reading one more byte; if it succeeds the
-    // stream was larger than the cap — reject it.
+    decoder.by_ref().take(MAX_DECOMPRESSED_BYTES).read_to_end(&mut buf)?;
     let mut probe = [0u8; 1];
     if decoder.read(&mut probe)? != 0 {
-        return Err(format!(
-            "Decompressed size exceeds the {} MiB safety limit — possible zip bomb",
-            MAX_DECOMPRESSED_BYTES / (1024 * 1024)
-        )
-        .into());
+        return Err(format!("Decompressed size exceeds {} MiB", MAX_DECOMPRESSED_BYTES / (1024 * 1024)).into());
     }
     Ok(buf)
 }
 
-// based on my python code converted to rust
 fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
     let mut entries = Vec::new();
     let mut curr = 0;
     let len = cd_bytes.len();
-
     while curr + 46 <= len {
-        if &cd_bytes[curr..curr + 4] != &[0x50, 0x4b, 0x01, 0x02] {
-            break;
-        }
-
+        if &cd_bytes[curr..curr + 4] != &[0x50, 0x4b, 0x01, 0x02] { break; }
         let comp_method = u16::from_le_bytes(cd_bytes[curr + 10..curr + 12].try_into().unwrap());
         let is_deflated = comp_method == 8;
-
         let mut comp_size = u32::from_le_bytes(cd_bytes[curr + 20..curr + 24].try_into().unwrap()) as u64;
         let mut uncomp_size = u32::from_le_bytes(cd_bytes[curr + 24..curr + 28].try_into().unwrap()) as u64;
         let name_len = u16::from_le_bytes(cd_bytes[curr + 28..curr + 30].try_into().unwrap()) as usize;
         let extra_len = u16::from_le_bytes(cd_bytes[curr + 30..curr + 32].try_into().unwrap()) as usize;
         let comment_len = u16::from_le_bytes(cd_bytes[curr + 32..curr + 34].try_into().unwrap()) as usize;
         let mut header_offset = u32::from_le_bytes(cd_bytes[curr + 42..curr + 46].try_into().unwrap()) as u64;
-
-        // Bounds-check the variable-length filename field before slicing.
         let name_start = curr + 46;
         let name_end = name_start + name_len;
         if name_end > len {
-            eprintln!("[WARN] Truncated CD entry at offset {curr} — stopping parse");
+            eprintln!("[WARN] Truncated CD entry at offset {curr}");
             break;
         }
-        let filename = std::str::from_utf8(&cd_bytes[name_start..name_end])
-            .unwrap_or("")
-            .to_string();
-
+        let filename = std::str::from_utf8(&cd_bytes[name_start..name_end]).unwrap_or("").to_string();
         if extra_len > 0 && (uncomp_size == 0xFFFFFFFF || comp_size == 0xFFFFFFFF || header_offset == 0xFFFFFFFF) {
             let extra_start = name_end;
             let extra_end = extra_start + extra_len;
@@ -210,85 +174,46 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
                 }
             }
         }
-
         entries.push(CdEntry { filename, header_offset, compressed_size: comp_size, is_deflated });
         curr += 46 + name_len + extra_len + comment_len;
     }
     entries
 }
 
-
-fn load_custom_certs() -> Result<Option<reqwest::Certificate>, Box<dyn std::error::Error>> {
+fn load_custom_certs() -> Result<Option<reqwest::Certificate>, Box<dyn std::error::Error + Send + Sync>> {
     let ca_path = match std::env::var("CUSTOM_CA_BUNDLE") {
         Ok(p) => p,
         Err(_) => return Ok(None),
     };
     println!("[INFO] Loading custom CA Bundle from: {}", ca_path);
-    let mut buf = StdFile::open(&ca_path)
-        .map_err(|e| format!("Could not open CUSTOM_CA_BUNDLE '{}': {}", ca_path, e))?;
+    let mut buf = StdFile::open(&ca_path).map_err(|e| format!("Could not open CUSTOM_CA_BUNDLE '{}': {}", ca_path, e))?;
     let mut cert_bytes = Vec::new();
     buf.read_to_end(&mut cert_bytes)?;
-    let cert = reqwest::Certificate::from_pem(&cert_bytes)
-        .map_err(|e| format!("Failed to parse PEM certificates from '{}': {}", ca_path, e))?;
+    let cert = reqwest::Certificate::from_pem(&cert_bytes).map_err(|e| format!("Failed to parse PEM certificates from '{}': {}", ca_path, e))?;
     Ok(Some(cert))
 }
 
-/// Fetch a single tileset JSON entry and return `(path, clipped_json, discovered_uris)`.
-async fn fetch_and_clip_json(
-    client: Arc<S3Client>,
-    bucket: String,
-    key: String,
-    archive_entries: Arc<Vec<CdEntry>>,
-    json_path: String,
-    polygon: Arc<geo::Polygon<f64>>,
-) -> Result<(String, serde_json::Value, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
-    let entry = archive_entries
-        .iter()
-        .find(|e| e.filename == json_path)
-        .ok_or_else(|| format!("Missing JSON entry: {}", json_path))?;
-
-    // Two-step fetch: first read the fixed 30-byte LFH header to learn
-    // extra_len, then fetch the payload — avoids the 256-byte magic padding.
-    let lfh_header = client
-        .fetch_range(&bucket, &key, entry.header_offset, entry.header_offset + 29)
-        .await?;
-    if lfh_header.len() < 30 {
-        return Err(format!("Short LFH header for '{}'", json_path).into());
-    }
+async fn fetch_and_clip_json(client: Arc<S3Client>, bucket: String, key: String, archive_entries: Arc<Vec<CdEntry>>, json_path: String, polygon: Arc<geo::Polygon<f64>>) -> Result<(String, serde_json::Value, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
+    let entry = archive_entries.iter().find(|e| e.filename == json_path).ok_or_else(|| format!("Missing JSON entry: {}", json_path))?;
+    let lfh_header = client.fetch_range(&bucket, &key, entry.header_offset, entry.header_offset + 29).await?;
+    if lfh_header.len() < 30 { return Err(format!("Short LFH header for '{}'", json_path).into()); }
     let lfh_fname_len = u16::from_le_bytes(lfh_header[26..28].try_into().unwrap()) as u64;
     let lfh_extra_len = u16::from_le_bytes(lfh_header[28..30].try_into().unwrap()) as u64;
     let payload_offset = entry.header_offset + 30 + lfh_fname_len + lfh_extra_len;
-
-    let compressed_bytes = client
-        .fetch_range(&bucket, &key, payload_offset, payload_offset + entry.compressed_size - 1)
-        .await?;
-
-    let json_bytes = if entry.is_deflated {
-        decompress_deflate(&compressed_bytes)?
-    } else {
-        compressed_bytes
-    };
-
+    let compressed_bytes = client.fetch_range(&bucket, &key, payload_offset, payload_offset + entry.compressed_size - 1).await?;
+    let json_bytes = if entry.is_deflated { decompress_deflate(&compressed_bytes)? } else { compressed_bytes };
     let json_val: serde_json::Value = serde_json::from_slice(&json_bytes)?;
     let mut local_uris = Vec::new();
     let clipped_json = clip::filter_tileset(json_val, &polygon, &mut local_uris);
-
     Ok((json_path, clipped_json, local_uris))
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
-
     if args.debug {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new("aws_config=debug,aws_sdk_s3=debug,reqwest=debug")),
-            )
-            .init();
+        tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("aws_config=debug,aws_sdk_s3=debug,reqwest=debug"))).init();
     }
-
     let mut geojson_str = String::new();
     if args.geojson == "-" {
         std::io::stdin().read_to_string(&mut geojson_str)?;
@@ -296,23 +221,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut geojson_file = StdFile::open(&args.geojson)?;
         geojson_file.read_to_string(&mut geojson_str)?;
     }
-    let clip_polygon = Arc::new(
-        clip::parse_geojson_polygon(&geojson_str).expect("Failed to parse GeoJSON"),
-    );
-
-    let custom_endpoint = std::env::var("AWS_S3_ENDPOINT")
-        .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
-        .ok();
-
+    let clip_polygon = Arc::new(clip::parse_geojson_polygon(&geojson_str).expect("Failed to parse GeoJSON"));
+    let custom_endpoint = std::env::var("AWS_S3_ENDPOINT").or_else(|_| std::env::var("AWS_ENDPOINT_URL")).ok();
     let s3_client = if args.no_sign_request {
-        // Propagate CA-bundle errors rather than silently ignoring them.
         let custom_cert = load_custom_certs()?;
         let mut builder = reqwest::Client::builder().use_rustls_tls();
         if let Some(cert) = custom_cert {
             builder = builder.add_root_certificate(cert);
         }
         let reqwest_client = builder.build()?;
-
         let base_url = custom_endpoint.unwrap_or_else(|| "https://s3.amazonaws.com".to_string());
         if args.debug && base_url != "https://s3.amazonaws.com" {
             println!("[DEBUG] Routing anonymous S3 requests to custom endpoint: {}", base_url);
@@ -322,119 +239,114 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
         let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config).force_path_style(true);
         if let Some(ref endpoint) = custom_endpoint {
-            if args.debug {
-                println!("[DEBUG] Routing S3 SDK requests to custom endpoint: {}", endpoint);
-            }
+            if args.debug { println!("[DEBUG] Routing S3 SDK requests to custom endpoint: {}", endpoint); }
             s3_config_builder = s3_config_builder.endpoint_url(endpoint);
         }
         S3Client::Signed(aws_sdk_s3::Client::from_conf(s3_config_builder.build()))
     };
-
     println!("Connecting to s3://{}/{}...", args.bucket, args.key);
-
-    let file_size = s3_client
-        .fetch_size(&args.bucket, &args.key)
-        .await
-        .expect("Failed to fetch file size");
-    let eocd_read_size = std::cmp::min(file_size, 65536);
-    let eocd_start = file_size - eocd_read_size;
-    let eocd_bytes = s3_client
-        .fetch_range(&args.bucket, &args.key, eocd_start, file_size - 1)
-        .await
-        .unwrap();
+    let file_size = s3_client.fetch_size(&args.bucket, &args.key).await?;
 
     let mut cd_offset = 0u64;
     let mut cd_size = 0u64;
 
+    let eocd_read_size = std::cmp::min(file_size, 65536);
+    let eocd_start = file_size - eocd_read_size;
+    let eocd_bytes = s3_client.fetch_range(&args.bucket, &args.key, eocd_start, file_size - 1).await?;
     for i in (0..eocd_bytes.len().saturating_sub(22)).rev() {
         if &eocd_bytes[i..i + 4] == &[0x50, 0x4b, 0x05, 0x06] {
-            cd_size = u32::from_le_bytes(eocd_bytes[i + 12..i + 16].try_into().unwrap()) as u64;
-            cd_offset = u32::from_le_bytes(eocd_bytes[i + 16..i + 20].try_into().unwrap()) as u64;
+            cd_size = u32::from_le_bytes(eocd_bytes[i + 12..i + 16].try_into()?) as u64;
+            cd_offset = u32::from_le_bytes(eocd_bytes[i + 16..i + 20].try_into()?) as u64;
             break;
         }
     }
-
     for i in (0..eocd_bytes.len().saturating_sub(20)).rev() {
         if &eocd_bytes[i..i + 4] == &[0x50, 0x4b, 0x06, 0x07] {
-            // Bounds-check before reading the Zip64 EOCD locator offset field.
-            if i + 16 > eocd_bytes.len() {
-                eprintln!("[WARN] Truncated Zip64 EOCD locator — skipping");
+            if i + 16 <= eocd_bytes.len() {
+                let zip64_eocd_offset = u64::from_le_bytes(eocd_bytes[i + 8..i + 16].try_into()?) as u64;
+                let z64_bytes = s3_client.fetch_range(&args.bucket, &args.key, zip64_eocd_offset, zip64_eocd_offset + 55).await?;
+                if z64_bytes.len() >= 56 && &z64_bytes[0..4] == &[0x50, 0x4b, 0x06, 0x06] {
+                    cd_size = u64::from_le_bytes(z64_bytes[40..48].try_into()?);
+                    cd_offset = u64::from_le_bytes(z64_bytes[48..56].try_into()?);
+                }
                 break;
             }
-            let zip64_eocd_offset =
-                u64::from_le_bytes(eocd_bytes[i + 8..i + 16].try_into().unwrap());
-
-            // Fetch exactly 56 bytes and validate length before indexing.
-            let z64_bytes = s3_client
-                .fetch_range(&args.bucket, &args.key, zip64_eocd_offset, zip64_eocd_offset + 55)
-                .await
-                .unwrap();
-            if z64_bytes.len() < 56 {
-                eprintln!("[WARN] Zip64 EOCD record too short ({} bytes) — skipping", z64_bytes.len());
-                break;
-            }
-            if &z64_bytes[0..4] == &[0x50, 0x4b, 0x06, 0x06] {
-                cd_size = u64::from_le_bytes(z64_bytes[40..48].try_into().unwrap());
-                cd_offset = u64::from_le_bytes(z64_bytes[48..56].try_into().unwrap());
-            }
-            break;
         }
     }
 
-    println!("[DEBUG] Fetching Central Directory ({} bytes)...", cd_size);
-    let cd_bytes = s3_client
-        .fetch_range(&args.bucket, &args.key, cd_offset, cd_offset + cd_size - 1)
-        .await
-        .unwrap();
-    let archive_entries = Arc::new(parse_central_directory(&cd_bytes));
-    println!("[DEBUG] Mapped {} file entries.", archive_entries.len());
+    if cd_size == 0 {
+        if args.debug { println!("[DEBUG] Fast EOCD scan failed. Engaging robust seeking scanner..."); }
+        const CHUNK_SIZE: u64 = 16384;
+        const MAX_EOCD_SEARCH_SIZE: u64 = 1024 * 1024;
+        let search_limit = std::cmp::min(file_size, MAX_EOCD_SEARCH_SIZE);
+        let mut current_pos = file_size;
+        let mut eocd_found = false;
+        while current_pos > file_size - search_limit {
+            let read_start = current_pos.saturating_sub(CHUNK_SIZE);
+            if args.debug { println!("[DEBUG] Scanning for EOCD in range: {}-{}", read_start, current_pos - 1); }
+            let buffer = s3_client.fetch_range(&args.bucket, &args.key, read_start, current_pos - 1).await?;
+            for i in (0..=buffer.len().saturating_sub(22)).rev() {
+                if &buffer[i..i+4] == &[0x50, 0x4b, 0x05, 0x06] {
+                    let eocd_absolute_pos = read_start + i as u64;
+                    if eocd_absolute_pos >= 20 {
+                        let locator_start = eocd_absolute_pos - 20;
+                        let locator_bytes = s3_client.fetch_range(&args.bucket, &args.key, locator_start, locator_start + 19).await?;
+                        if &locator_bytes[0..4] == &[0x50, 0x4b, 0x06, 0x07] {
+                            let zip64_eocd_offset = u64::from_le_bytes(locator_bytes[8..16].try_into()?);
+                            let z64_record_bytes = s3_client.fetch_range(&args.bucket, &args.key, zip64_eocd_offset, zip64_eocd_offset + 55).await?;
+                            if &z64_record_bytes[0..4] == &[0x50, 0x4b, 0x06, 0x06] {
+                                cd_size = u64::from_le_bytes(z64_record_bytes[40..48].try_into()?);
+                                cd_offset = u64::from_le_bytes(z64_record_bytes[48..56].try_into()?);
+                                if args.debug { println!("[DEBUG] Fallback scanner found ZIP64 EOCD. Size: {}, Offset: {}", cd_size, cd_offset); }
+                                eocd_found = true;
+                                break;
+                            }
+                        }
+                    }
+                    cd_size = u32::from_le_bytes(buffer[i+12..i+16].try_into()?) as u64;
+                    cd_offset = u32::from_le_bytes(buffer[i+16..i+20].try_into()?) as u64;
+                    if args.debug { println!("[DEBUG] Fallback scanner found standard EOCD. Size: {}, Offset: {}", cd_size, cd_offset); }
+                    eocd_found = true;
+                    break;
+                }
+            }
+            if eocd_found { break; }
+            current_pos = read_start;
+        }
+    }
 
-    // ── Parallel BFS over nested tileset JSONs ────────────────────────────────
-    // Instead of a serial queue we dispatch all pending JSON fetches concurrently
-    // and collect results as they arrive, greatly reducing wall-clock time for
-    // deeply nested tilesets.
+    if cd_size == 0 {
+        eprintln!("[ERROR] FATAL: Could not map Central Directory. File may be corrupted or not a valid zip archive.");
+        return Ok(());
+    }
+
+    println!("Fetching Central Directory ({} bytes)...", cd_size);
+    let cd_bytes = s3_client.fetch_range(&args.bucket, &args.key, cd_offset, cd_offset + cd_size - 1).await?;
+    let archive_entries = Arc::new(parse_central_directory(&cd_bytes));
+    println!("Mapped {} file entries.", archive_entries.len());
+
     let s3_client_arc = Arc::new(s3_client.clone());
     let mut processed_jsons: HashMap<String, serde_json::Value> = HashMap::new();
     let mut keep_uris: HashSet<String> = HashSet::new();
-    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+    let mut in_flight = FuturesUnordered::new();
     let mut queued: HashSet<String> = HashSet::new();
-
     let root = "tileset.json".to_string();
     keep_uris.insert(root.clone());
     queued.insert(root.clone());
-    in_flight.push(fetch_and_clip_json(
-        s3_client_arc.clone(),
-        args.bucket.clone(),
-        args.key.clone(),
-        archive_entries.clone(),
-        root,
-        clip_polygon.clone(),
-    ));
-
+    in_flight.push(fetch_and_clip_json(s3_client_arc.clone(), args.bucket.clone(), args.key.clone(), archive_entries.clone(), root, clip_polygon.clone()));
     while let Some(result) = in_flight.next().await {
         match result {
             Err(e) => eprintln!("[WARN] JSON fetch failed: {}", e),
             Ok((json_path, clipped_json, local_uris)) => {
                 for uri in local_uris {
-                    // Security: skip URIs that would escape the archive root.
                     let resolved = match resolve_uri(&json_path, &uri) {
                         Some(r) => r,
-                        None => {
-                            eprintln!("[WARN] Rejected path-traversal URI '{}' in '{}'", uri, json_path);
-                            continue;
-                        }
+                        None => { eprintln!("[WARN] Rejected path-traversal URI '{}' in '{}'", uri, json_path); continue; }
                     };
                     if keep_uris.insert(resolved.clone()) {
                         if resolved.ends_with(".json") && !queued.contains(&resolved) {
                             queued.insert(resolved.clone());
-                            in_flight.push(fetch_and_clip_json(
-                                s3_client_arc.clone(),
-                                args.bucket.clone(),
-                                args.key.clone(),
-                                archive_entries.clone(),
-                                resolved,
-                                clip_polygon.clone(),
-                            ));
+                            in_flight.push(fetch_and_clip_json(s3_client_arc.clone(), args.bucket.clone(), args.key.clone(), archive_entries.clone(), resolved, clip_polygon.clone()));
                         }
                     }
                 }
@@ -442,35 +354,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    // ─────────────────────────────────────────────────────────────────────────
-
+    
     println!("Found {} files that intersect, fetching files ...", keep_uris.len());
     let out_file = AsyncFile::create(&args.output).await?;
     let mut zip_writer = ZipFileWriter::new(out_file.compat_write());
-
     let pb = if args.progress {
         let bar = ProgressBar::new(keep_uris.len() as u64);
-        bar.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}")
-                .unwrap(),
-        );
+        bar.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}").unwrap());
         Some(Arc::new(bar))
-    } else {
-        None
-    };
-
+    } else { None };
     let semaphore = Arc::new(Semaphore::new(args.concurrency));
     let (tx, mut rx) = mpsc::channel::<DownloadedFile>(args.concurrency * 2);
     let mut fetch_tasks = Vec::new();
-
     for entry in archive_entries.iter() {
-        if !keep_uris.contains(&entry.filename) {
-            continue;
-        }
+        if !keep_uris.contains(&entry.filename) { continue; }
         let filename = entry.filename.clone();
-
-        // Already-clipped JSON — send directly without a network round-trip.
         if let Some(clipped_json) = processed_jsons.get(&filename) {
             let data = serde_json::to_string(clipped_json)?.into_bytes();
             let tx_clone = tx.clone();
@@ -479,12 +377,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }));
             continue;
         }
-
         let header_offset = entry.header_offset;
         let compressed_size = entry.compressed_size;
-        let _filename_len = filename.len();
         let is_deflated = entry.is_deflated;
-
         let semaphore_clone = semaphore.clone();
         let tx_clone = tx.clone();
         let pb_clone = pb.clone();
@@ -492,106 +387,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bucket_clone = args.bucket.clone();
         let key_clone = args.key.clone();
         let target_filename = filename.clone();
-
         let task = tokio::spawn(async move {
             let _permit = semaphore_clone.acquire_owned().await.unwrap();
-            if let Some(ref bar) = pb_clone {
-                bar.set_message(format!("Fetching {}", target_filename));
-            }
-
-            // Two-step fetch: read the 30-byte LFH header first to get the
-            // exact extra_len, avoiding the previous 256-byte magic padding.
-            let lfh_header = match client_clone
-                .fetch_range(&bucket_clone, &key_clone, header_offset, header_offset + 29)
-                .await
-            {
+            if let Some(ref bar) = pb_clone { bar.set_message(format!("Fetching {}", target_filename)); }
+            let lfh_header = match client_clone.fetch_range(&bucket_clone, &key_clone, header_offset, header_offset + 29).await {
                 Ok(b) => b,
-                Err(e) => {
-                    eprintln!("\n[ERROR] LFH header fetch failed for '{}': {:?}", target_filename, e);
-                    return;
-                }
+                Err(e) => { eprintln!("\n[ERROR] LFH header fetch failed for '{}': {:?}", target_filename, e); return; }
             };
-            if lfh_header.len() < 30 {
-                eprintln!("\n[ERROR] Short LFH header for '{}'", target_filename);
-                return;
-            }
+            if lfh_header.len() < 30 { eprintln!("\n[ERROR] Short LFH header for '{}'", target_filename); return; }
             let lfh_fname_len = u16::from_le_bytes(lfh_header[26..28].try_into().unwrap()) as u64;
             let lfh_extra_len = u16::from_le_bytes(lfh_header[28..30].try_into().unwrap()) as u64;
             let payload_start_offset = header_offset + 30 + lfh_fname_len + lfh_extra_len;
-
-            let compressed_data = match client_clone
-                .fetch_range(
-                    &bucket_clone,
-                    &key_clone,
-                    payload_start_offset,
-                    payload_start_offset + compressed_size - 1,
-                )
-                .await
-            {
+            let compressed_data = match client_clone.fetch_range(&bucket_clone, &key_clone, payload_start_offset, payload_start_offset + compressed_size - 1).await {
                 Ok(b) => b,
-                Err(e) => {
-                    eprintln!("\n[ERROR] Payload fetch failed for '{}': {:?}", target_filename, e);
-                    return;
-                }
+                Err(e) => { eprintln!("\n[ERROR] Payload fetch failed for '{}': {:?}", target_filename, e); return; }
             };
-
             let data = if is_deflated {
                 match decompress_deflate(&compressed_data) {
                     Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("\n[ERROR] Decompression failed for '{}': {}", target_filename, e);
-                        return;
-                    }
+                    Err(e) => { eprintln!("\n[ERROR] Decompression failed for '{}': {}", target_filename, e); return; }
                 }
-            } else {
-                compressed_data
-            };
-
+            } else { compressed_data };
             let _ = tx_clone.send(DownloadedFile { filename: target_filename, data }).await;
         });
         fetch_tasks.push(task);
     }
-
     drop(tx);
     while let Some(file) = rx.recv().await {
         let builder = ZipEntryBuilder::new(file.filename.clone().into(), Compression::Deflate);
         zip_writer.write_entry_whole(builder, &file.data).await.unwrap();
-        if let Some(ref bar) = pb {
-            bar.inc(1);
-        }
+        if let Some(ref bar) = pb { bar.inc(1); }
     }
-    for task in fetch_tasks {
-        task.await.unwrap();
-    }
-
+    for task in fetch_tasks { task.await.unwrap(); }
     let dummy_index = vec![0u8; keep_uris.len() * 24];
-    zip_writer
-        .write_entry_whole(
-            ZipEntryBuilder::new("@3dtilesIndex1@".into(), Compression::Stored),
-            &dummy_index,
-        )
-        .await?;
+    zip_writer.write_entry_whole(ZipEntryBuilder::new("@3dtilesIndex1@".into(), Compression::Stored), &dummy_index).await?;
     zip_writer.close().await?;
-    if let Some(ref bar) = pb {
-        bar.finish_with_message("Done!");
-    }
-
+    if let Some(ref bar) = pb { bar.finish_with_message("Done!"); }
     println!("Adding 3tz index to zipfile ...");
-    let mut file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&args.output)
-        .await?;
+    let mut file = tokio::fs::OpenOptions::new().read(true).write(true).open(&args.output).await?;
     let read_file = StdFile::open(&args.output)?;
     let mut final_archive = ZipArchive::new(read_file)?;
-
-    struct IndexRecord {
-        md5hash: [u8; 16],
-        offset: u64,
-    }
+    struct IndexRecord { md5hash: [u8; 16], offset: u64 }
     let mut tzindex: Vec<IndexRecord> = Vec::new();
     let mut index_header_offset = 0u64;
-
     for i in 0..final_archive.len() {
         let file_entry = final_archive.by_index(i)?;
         if file_entry.name() == "@3dtilesIndex1@" {
@@ -602,30 +440,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tzindex.push(IndexRecord { md5hash: digest.0, offset: file_entry.header_start() });
         }
     }
-
-    tzindex.sort_by_key(|x| {
-        (
-            u64::from_le_bytes(x.md5hash[0..8].try_into().unwrap()),
-            u64::from_le_bytes(x.md5hash[8..16].try_into().unwrap()),
-        )
-    });
+    tzindex.sort_by_key(|x| (u64::from_le_bytes(x.md5hash[0..8].try_into().unwrap()), u64::from_le_bytes(x.md5hash[8..16].try_into().unwrap())));
     let mut bindex = Vec::with_capacity(tzindex.len() * 24);
     for i in tzindex {
         bindex.extend_from_slice(&i.md5hash);
         bindex.extend_from_slice(&i.offset.to_le_bytes());
     }
-
     let crc32 = crc32fast::hash(&bindex);
-    let index_payload_offset = final_archive
-        .by_name("@3dtilesIndex1@")?
-        .data_start()
-        .expect("Index payload offset not found");
-
+    let index_payload_offset = final_archive.by_name("@3dtilesIndex1@")?.data_start().expect("Index payload offset not found");
     file.seek(SeekFrom::Start(index_payload_offset)).await?;
     file.write_all(&bindex).await?;
     file.seek(SeekFrom::Start(index_header_offset + 14)).await?;
     file.write_all(&crc32.to_le_bytes()).await?;
-
     println!("Success! Clipped dataset complete");
     Ok(())
 }
