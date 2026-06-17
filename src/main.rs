@@ -18,11 +18,10 @@ use zip::ZipArchive;
 use tracing_subscriber::EnvFilter;
 use futures::stream::{FuturesUnordered, StreamExt};
 
-/// Maximum decompressed size per entry (64 MiB) — prevents zip bomb attacks.
 const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Cloud-Optimized 3dtiles 3tz Clipper")]
+#[command(author, version, about = "Cloud-Optimized 3dtiles (3tz) & I3S (slpk) Clipper")]
 struct Args {
     #[arg(short, long)] bucket: String,
     #[arg(short, long)] key: String,
@@ -32,6 +31,38 @@ struct Args {
     #[arg(short, long, default_value_t = 10)] concurrency: usize,
     #[arg(long, default_value_t = false)] debug: bool,
     #[arg(long, default_value_t = false)] no_sign_request: bool,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+enum DatasetFormat {
+    ThreeDTiles,
+    I3S,
+}
+
+impl DatasetFormat {
+    fn from_key(key: &str) -> Self {
+        let lower = key.to_lowercase();
+        if lower.ends_with(".slpk") || lower.ends_with(".i3s") {
+            DatasetFormat::I3S
+        } else {
+            DatasetFormat::ThreeDTiles
+        }
+    }
+
+    // Return a list of possible index file names.
+    fn potential_index_names(&self) -> Vec<&'static str> {
+        match self {
+            DatasetFormat::ThreeDTiles => vec!["@3dtilesIndex1@"],
+            DatasetFormat::I3S => vec!["@speckIndex1@", "@specialIndexFileHASH128@"],
+        }
+    }
+
+    fn root_file_name(&self) -> &'static str {
+        match self {
+            DatasetFormat::ThreeDTiles => "tileset.json",
+            DatasetFormat::I3S => "3dSceneLayer.json",
+        }
+    }
 }
 
 struct CdEntry {
@@ -193,7 +224,7 @@ fn load_custom_certs() -> Result<Option<reqwest::Certificate>, Box<dyn std::erro
     Ok(Some(cert))
 }
 
-async fn fetch_and_clip_json(client: Arc<S3Client>, bucket: String, key: String, archive_entries: Arc<Vec<CdEntry>>, json_path: String, polygon: Arc<geo::Polygon<f64>>) -> Result<(String, serde_json::Value, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
+async fn fetch_and_clip_json(client: Arc<S3Client>, bucket: String, key: String, archive_entries: Arc<Vec<CdEntry>>, json_path: String, polygon: Arc<geo::Polygon<f64>>, format: Arc<DatasetFormat>) -> Result<(String, serde_json::Value, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
     let entry = archive_entries.iter().find(|e| e.filename == json_path).ok_or_else(|| format!("Missing JSON entry: {}", json_path))?;
     let lfh_header = client.fetch_range(&bucket, &key, entry.header_offset, entry.header_offset + 29).await?;
     if lfh_header.len() < 30 { return Err(format!("Short LFH header for '{}'", json_path).into()); }
@@ -204,7 +235,11 @@ async fn fetch_and_clip_json(client: Arc<S3Client>, bucket: String, key: String,
     let json_bytes = if entry.is_deflated { decompress_deflate(&compressed_bytes)? } else { compressed_bytes };
     let json_val: serde_json::Value = serde_json::from_slice(&json_bytes)?;
     let mut local_uris = Vec::new();
-    let clipped_json = clip::filter_tileset(json_val, &polygon, &mut local_uris);
+    let clipped_json = if *format == DatasetFormat::I3S {
+        clip::filter_i3s_node(json_val, &polygon, &mut local_uris)
+    } else {
+        clip::filter_tileset(json_val, &polygon, &mut local_uris)
+    };
     Ok((json_path, clipped_json, local_uris))
 }
 
@@ -214,6 +249,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if args.debug {
         tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("aws_config=debug,aws_sdk_s3=debug,reqwest=debug"))).init();
     }
+    
+    let format = Arc::new(DatasetFormat::from_key(&args.key));
+    println!("[INFO] Detected Format: {:?}", format);
+
     let mut geojson_str = String::new();
     if args.geojson == "-" {
         std::io::stdin().read_to_string(&mut geojson_str)?;
@@ -222,10 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         geojson_file.read_to_string(&mut geojson_str)?;
     }
     let clip_polygon = Arc::new(clip::parse_geojson_polygon(&geojson_str).expect("Failed to parse GeoJSON"));
-    let custom_endpoint = std::env::var("AWS_S3_ENDPOINT")
-        .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
-        .map(|url| format!("https://{}", url))
-        .ok();
+    let custom_endpoint = std::env::var("AWS_S3_ENDPOINT").or_else(|_| std::env::var("AWS_ENDPOINT_URL")).ok();
     let s3_client = if args.no_sign_request {
         let custom_cert = load_custom_certs()?;
         let mut builder = reqwest::Client::builder().use_rustls_tls();
@@ -317,26 +353,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             current_pos = read_start;
         }
     }
-
+    
     if cd_size == 0 {
         eprintln!("[ERROR] FATAL: Could not map Central Directory. File may be corrupted or not a valid zip archive.");
         return Ok(());
     }
 
-    println!("Fetching Central Directory ({} bytes)...", cd_size);
+    println!("[DEBUG] Fetching Central Directory ({} bytes)...", cd_size);
     let cd_bytes = s3_client.fetch_range(&args.bucket, &args.key, cd_offset, cd_offset + cd_size - 1).await?;
     let archive_entries = Arc::new(parse_central_directory(&cd_bytes));
-    println!("Mapped {} file entries.", archive_entries.len());
+    println!("[DEBUG] Mapped {} file entries.", archive_entries.len());
 
     let s3_client_arc = Arc::new(s3_client.clone());
     let mut processed_jsons: HashMap<String, serde_json::Value> = HashMap::new();
     let mut keep_uris: HashSet<String> = HashSet::new();
     let mut in_flight = FuturesUnordered::new();
     let mut queued: HashSet<String> = HashSet::new();
-    let root = "tileset.json".to_string();
+    let root = format.root_file_name().to_string();
     keep_uris.insert(root.clone());
     queued.insert(root.clone());
-    in_flight.push(fetch_and_clip_json(s3_client_arc.clone(), args.bucket.clone(), args.key.clone(), archive_entries.clone(), root, clip_polygon.clone()));
+    in_flight.push(fetch_and_clip_json(s3_client_arc.clone(), args.bucket.clone(), args.key.clone(), archive_entries.clone(), root, clip_polygon.clone(), format.clone()));
     while let Some(result) = in_flight.next().await {
         match result {
             Err(e) => eprintln!("[WARN] JSON fetch failed: {}", e),
@@ -347,9 +383,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         None => { eprintln!("[WARN] Rejected path-traversal URI '{}' in '{}'", uri, json_path); continue; }
                     };
                     if keep_uris.insert(resolved.clone()) {
-                        if resolved.ends_with(".json") && !queued.contains(&resolved) {
+                        let is_json = resolved.ends_with(".json");
+                        let is_i3s_nodepage = *format == DatasetFormat::I3S && !is_json; // I3S node pages might not have a .json extension
+                        if (is_json || is_i3s_nodepage) && !queued.contains(&resolved) {
                             queued.insert(resolved.clone());
-                            in_flight.push(fetch_and_clip_json(s3_client_arc.clone(), args.bucket.clone(), args.key.clone(), archive_entries.clone(), resolved, clip_polygon.clone()));
+                            in_flight.push(fetch_and_clip_json(s3_client_arc.clone(), args.bucket.clone(), args.key.clone(), archive_entries.clone(), resolved, clip_polygon.clone(), format.clone()));
                         }
                     }
                 }
@@ -422,27 +460,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(ref bar) = pb { bar.inc(1); }
     }
     for task in fetch_tasks { task.await.unwrap(); }
+
+    // Discover the correct index filename to use for writing. Default to the first potential name.
+    let index_filename_to_write = format.potential_index_names()[0];
     let dummy_index = vec![0u8; keep_uris.len() * 24];
-    zip_writer.write_entry_whole(ZipEntryBuilder::new("@3dtilesIndex1@".into(), Compression::Stored), &dummy_index).await?;
+    zip_writer.write_entry_whole(ZipEntryBuilder::new(index_filename_to_write.into(), Compression::Stored), &dummy_index).await?;
     zip_writer.close().await?;
     if let Some(ref bar) = pb { bar.finish_with_message("Done!"); }
-    println!("Adding 3tz index to zipfile ...");
+    
+    println!("Adding spatial index to archive ...");
     let mut file = tokio::fs::OpenOptions::new().read(true).write(true).open(&args.output).await?;
     let read_file = StdFile::open(&args.output)?;
     let mut final_archive = ZipArchive::new(read_file)?;
     struct IndexRecord { md5hash: [u8; 16], offset: u64 }
     let mut tzindex: Vec<IndexRecord> = Vec::new();
     let mut index_header_offset = 0u64;
+
+    // Dynamically find which index file is used
+    let potential_indices = format.potential_index_names();
+    let mut found_index_name = None;
+
     for i in 0..final_archive.len() {
         let file_entry = final_archive.by_index(i)?;
-        if file_entry.name() == "@3dtilesIndex1@" {
+        let name = file_entry.name();
+        if potential_indices.contains(&name) {
             index_header_offset = file_entry.header_start();
+            found_index_name = Some(name.to_string());
         } else {
-            let normalized_path = file_entry.name().replace('\\', "/");
+            let normalized_path = name.replace('\\', "/");
             let digest = md5::compute(normalized_path.as_bytes());
             tzindex.push(IndexRecord { md5hash: digest.0, offset: file_entry.header_start() });
         }
     }
+    
+    let index_filename = found_index_name.ok_or("Could not find a valid index file in the archive")?;
+    println!("[DEBUG] Found and using index file: {}", index_filename);
+
     tzindex.sort_by_key(|x| (u64::from_le_bytes(x.md5hash[0..8].try_into().unwrap()), u64::from_le_bytes(x.md5hash[8..16].try_into().unwrap())));
     let mut bindex = Vec::with_capacity(tzindex.len() * 24);
     for i in tzindex {
@@ -450,7 +503,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         bindex.extend_from_slice(&i.offset.to_le_bytes());
     }
     let crc32 = crc32fast::hash(&bindex);
-    let index_payload_offset = final_archive.by_name("@3dtilesIndex1@")?.data_start().expect("Index payload offset not found");
+    let index_payload_offset = final_archive.by_name(&index_filename)?.data_start().expect("Index payload offset not found");
     file.seek(SeekFrom::Start(index_payload_offset)).await?;
     file.write_all(&bindex).await?;
     file.seek(SeekFrom::Start(index_header_offset + 14)).await?;
