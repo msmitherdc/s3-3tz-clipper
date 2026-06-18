@@ -157,7 +157,7 @@ pub fn filter_i3s_node(mut node_page: JsonValue, polygon: &Polygon<f64>, local_u
     if let Some(nodes) = node_page.get_mut("nodes").and_then(|n| n.as_array_mut()) {
         let mut kept_nodes = Vec::new();
 
-        for mut node in nodes.drain(..) {
+        for node in nodes.drain(..) {
             let mut intersects = true;
 
             // I3S usually uses MBS (Minimum Bounding Sphere) in WGS84 for node evaluation
