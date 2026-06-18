@@ -42,7 +42,7 @@ enum DatasetFormat {
 impl DatasetFormat {
     fn from_key(key: &str) -> Self {
         let lower = key.to_lowercase();
-        if lower.ends_with(".slpk") || lower.ends_with(".i3s") {
+        if lower.ends_with(".slpk") || lower.ends_with(".i3s") || lower.ends_with(".spk") {
             DatasetFormat::I3S
         } else {
             DatasetFormat::ThreeDTiles
