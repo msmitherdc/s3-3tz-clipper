@@ -2547,7 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "s3-3tz-clipper"
-version = "1.0.2"
+version = "1.0.6"
 dependencies = [
  "async_zip",
  "aws-config",
@@ -2566,6 +2566,7 @@ dependencies = [
  "rustls-pemfile",
  "rustls-webpki 0.103.13",
  "s2",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",
