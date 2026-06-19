@@ -2547,7 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "s3-3tz-clipper"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "async_zip",
  "aws-config",

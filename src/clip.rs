@@ -129,16 +129,18 @@ pub fn filter_i3s_scenelayer(
         .to_string();
 
     let mut queue: VecDeque<String> = VecDeque::new();
-    let root_candidates = [
-        root_id.as_str(),
-        "root",
-        "0",
-    ];
+
+    // For I3S 1.7+ node-page datasets the tree root is always node index "0".
+    // The archive also contains a legacy `nodes/root/3dNodeIndexDocument.json` whose
+    // children list uses old-style string IDs covering only the top 1-2 levels of the
+    // tree — starting traversal there causes BFS to miss the vast majority of nodes.
+    // Always prefer "0" (node-page global index); fall back to the store.rootNode
+    // string only if "0" is absent (pure 1.6 dataset).
+    let root_candidates: &[&str] = &["0", root_id.as_str(), "root"];
 
     let mut found_root = false;
-
     for candidate in root_candidates {
-        if all_nodes.contains_key(candidate) {
+        if all_nodes.contains_key(*candidate) {
             queue.push_back(candidate.to_string());
             found_root = true;
             break;
@@ -146,7 +148,7 @@ pub fn filter_i3s_scenelayer(
     }
 
     if !found_root {
-        eprintln!("[ERROR] Could not find a valid root node ('{}' or '0') to start traversal.", root_id);
+        eprintln!("[ERROR] Could not find root node ('0' or '{}') in {} parsed nodes.", root_id, all_nodes.len());
         return;
     }
 
@@ -158,8 +160,6 @@ pub fn filter_i3s_scenelayer(
         }
     };
 
-    // Track visited nodes to avoid re-processing cycles (shouldn't happen in valid
-    // I3S but guards against malformed data).
     let mut visited: HashSet<String> = HashSet::new();
 
     while let Some(node_id) = queue.pop_front() {
@@ -200,6 +200,17 @@ pub fn filter_i3s_scenelayer(
             },
         );
 
+        // Always enqueue children for traversal regardless of whether this node
+        // intersects. The I3S LOD tree is NOT a strict spatial containment hierarchy —
+        // a parent's MBS does not always tightly bound all its children's bounds, so
+        // culling children based on parent intersection causes nodes to be missed.
+        // We only gate *resource keeping* on the intersection test.
+        for child in &node.children {
+            if !visited.contains(&child.id) {
+                queue.push_back(child.id.clone());
+            }
+        }
+
         // Fast AABB pre-check before the more expensive polygon intersection.
         if !polygon_bbox.intersects(&node_bbox) {
             continue;
@@ -209,22 +220,12 @@ pub fn filter_i3s_scenelayer(
             continue;
         }
 
-        // --- This node intersects: keep its document(s) ---
-        //
-        // Per-node resources (geometries/, textures/, attributes/, shared/, features/)
-        // are NOT enumerated here. In I3S 1.7+ they aren't listed on the node JSON at
-        // all — the caller expands `nodes/{kept_id}/*` from the archive entry list
-        // after traversal, which works for both 1.7+ and 1.6 layouts.
-
+        // This node intersects: keep its document(s). Per-node resources
+        // (geometries/, textures/, attributes/, etc.) are expanded by the caller
+        // via a prefix scan over the archive entries for each kept node id.
         keep_uris.insert(node.containing_doc.clone());
         keep_uris.insert(node.doc_filename.clone());
         kept_node_ids.insert(node.id.clone());
-
-        for child in &node.children {
-            if !visited.contains(&child.id) {
-                queue.push_back(child.id.clone());
-            }
-        }
     }
 }
 
