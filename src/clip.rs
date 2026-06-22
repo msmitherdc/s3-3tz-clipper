@@ -74,9 +74,10 @@ pub fn parse_geojson_polygon(geojson_str: &str) -> Option<Polygon<f64>> {
 /// against a base path (the directory containing the node document).
 /// Returns None if the resolved path would escape the archive root (path traversal).
 pub fn resolve_uri(base_doc_path: &str, href: &str) -> Option<String> {
-    // Build an absolute-style path by joining base dir + href, then normalize.
-    let base_dir = Path::new(base_doc_path).parent().unwrap_or(Path::new(""));
-    let joined = base_dir.join(href.trim_start_matches("./"));
+    let base_doc_path_norm = base_doc_path.replace('\\', "/");
+    let href_norm = href.replace('\\', "/");
+    let base_dir = Path::new(&base_doc_path_norm).parent().unwrap_or(Path::new(""));
+    let joined = base_dir.join(href_norm.trim_start_matches("./"));
 
     // Normalize by processing components, rejecting upward escapes past root.
     let mut parts: Vec<&str> = Vec::new();
@@ -122,7 +123,8 @@ pub fn filter_i3s_scenelayer(
         .and_then(|s| s.get("rootNode"))
         .and_then(|r| r.as_str())
         .unwrap_or("./nodes/root");
-    let root_id = Path::new(root_node_path_str)
+    let root_node_path_norm = root_node_path_str.replace('\\', "/");
+    let root_id = Path::new(&root_node_path_norm)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("root")

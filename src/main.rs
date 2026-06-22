@@ -19,6 +19,9 @@ use flate2::Compression as GzCompression;
 use zip::ZipArchive;
 use tracing_subscriber::EnvFilter;
 use futures::stream::{FuturesUnordered, StreamExt};
+use geo::{Intersects, BoundingRect};
+use std::path::Path;
+use crate::clip::{I3SNode, ChildRef};
 
 /// Maximum decompressed size per entry (64 MiB) — prevents zip bomb attacks.
 const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
@@ -141,7 +144,11 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
             eprintln!("[WARN] Truncated CD entry at offset {curr}");
             break;
         }
-        let filename = std::str::from_utf8(&cd_bytes[name_start..name_end]).unwrap_or("").to_string();
+        let mut filename = std::str::from_utf8(&cd_bytes[name_start..name_end]).unwrap_or("").to_string();
+        
+        // Normalize Windows backslashes to forward slashes
+        filename = filename.replace('\\', "/");
+        
         if extra_len > 0 && (uncomp_size == 0xFFFFFFFF || comp_size == 0xFFFFFFFF || header_offset == 0xFFFFFFFF) {
             let extra_start = name_end;
             let extra_end = extra_start + extra_len;
@@ -379,284 +386,253 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         
         let mut all_nodes = HashMap::new();
         
-        // I3S 1.7+ only: nodes are paginated under `nodepages/{N}.json[.gz]`.
+        // Declare the node_doc_filter closure at the top level of this block so it is visible everywhere
         let node_doc_filter = |e: &&CdEntry| {
             let f = &e.filename;
-            f.starts_with("nodepages/") && (f.ends_with(".json") || f.ends_with(".json.gz"))
+            (f.starts_with("nodepages/") || f.contains("/nodepages/")) 
+                && (f.ends_with(".json") || f.ends_with(".json.gz"))
         };
 
-        println!("Fetching and parsing I3S node pages (Parallel)...");
-        let mut fetch_tasks = FuturesUnordered::new();
-        let semaphore = Arc::new(Semaphore::new(args.concurrency));
+        let is_i3s_17 = archive_entries.iter().any(|e| {
+            let f = &e.filename;
+            f.starts_with("nodepages/") || f.contains("/nodepages/")
+        });
 
-        for entry in archive_entries.iter().filter(node_doc_filter) {
-            let entry_clone = entry.clone();
-            let client = s3_client_arc.clone();
-            let bucket = args.bucket.clone();
-            let key = args.key.clone();
-            let sem = semaphore.clone();
-            
-            fetch_tasks.push(tokio::spawn(async move {
-                let _permit = sem.acquire_owned().await.unwrap();
-                let bytes_res = fetch_file_content(&client, &bucket, &key, &entry_clone).await;
-                (entry_clone, bytes_res)
-            }));
-        }
+        let mut kept_node_ids: HashSet<String> = HashSet::new();
 
-        while let Some(res) = fetch_tasks.next().await {
-            let (entry, bytes_res) = res.unwrap();
-            let doc_filename = entry.filename.strip_suffix(".gz").unwrap_or(&entry.filename).to_string();
+        if is_i3s_17 {
+            println!("Fetching and parsing I3S 1.7+ node pages (Parallel)...");
+            let mut fetch_tasks = FuturesUnordered::new();
+            let semaphore = Arc::new(Semaphore::new(args.concurrency));
 
-            match bytes_res {
-                Ok(node_bytes) => {
-                    if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&node_bytes) {
-                        let mut nodes_to_process = Vec::new();
+            for entry in archive_entries.iter().filter(node_doc_filter) {
+                let entry_clone = entry.clone();
+                let client = s3_client_arc.clone();
+                let bucket = args.bucket.clone();
+                let key = args.key.clone();
+                let sem = semaphore.clone();
+                
+                fetch_tasks.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.unwrap();
+                    let bytes_res = fetch_file_content(&*client, &bucket, &key, &entry_clone).await;
+                    (entry_clone, bytes_res)
+                }));
+            }
 
-                        if let Some(nodes_arr) = json_val.get("nodes").and_then(|n| n.as_array()) {
-                            nodes_to_process.extend(nodes_arr.iter());
-                        } else {
-                            nodes_to_process.push(&json_val);
-                        }
+            while let Some(res) = fetch_tasks.next().await {
+                let (entry, bytes_res) = res.unwrap();
+                let doc_filename = entry.filename.strip_suffix(".gz").unwrap_or(&entry.filename).to_string();
 
-                        for node_val in nodes_to_process {
-                            let id_value =
-                                node_val.get("id")
-                                    .or_else(|| node_val.get("index"));
+                match bytes_res {
+                    Ok(node_bytes) => {
+                        if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&node_bytes) {
+                            let mut nodes_to_process = Vec::new();
 
-                            let id = match id_value {
-                                Some(v) if v.is_string() => {
-                                    v.as_str().unwrap().to_string()
-                                }
-                                Some(v) if v.is_number() => {
-                                    v.as_number().unwrap().to_string()
-                                }
-                                _ => continue,
-                            };
-
-                            // doc_filename must be derived from the node's own ID, not the
-                            // containing document's path. When a document holds a "nodes" array,
-                            // all nodes in it share the same doc_filename if we use the document
-                            // path — but their resources live under nodes/{id}/*, not under the
-                            // containing document's directory. Derive the canonical path from id.
-                            //
-                            // We detect whether the archive uses a "nodes/{id}/..." layout by
-                            // checking the containing document's path: if it starts with "nodes/",
-                            // assume the same layout for all nodes. Otherwise fall back to the
-                            // containing document's own directory.
-                            let node_doc_filename = if doc_filename.starts_with("nodes/") {
-                                format!("nodes/{}/3dNodeIndexDocument.json", id)
+                            if let Some(nodes_arr) = json_val.get("nodes").and_then(|n| n.as_array()) {
+                                nodes_to_process.extend(nodes_arr.iter());
                             } else {
-                                // Flat or custom layout: keep the containing document path as-is.
-                                // Resources for this node will be resolved relative to its directory.
-                                doc_filename.clone()
-                            };
+                                nodes_to_process.push(&json_val);
+                            }
 
-                            let mut mbs = [0.0f64; 4];
-                            let mut has_bounds = false;
+                            for node_val in nodes_to_process {
+                                let id_value = node_val.get("id");
 
-                            if let Some(mbs_arr) = node_val.get("mbs").and_then(|m| m.as_array()) {
-                                // mbs = [center_lon, center_lat, center_z, radius_meters]
-                                for i in 0..4 {
-                                    mbs[i] = mbs_arr.get(i).and_then(|n| n.as_f64()).unwrap_or(0.0);
-                                }
-                                has_bounds = true;
-                            } else if let Some(obb) = node_val.get("obb").and_then(|o| o.as_object()) {
-                                // OBB spec (I3S 1.7+): { center: [x,y,z], halfSize: [hx,hy,hz], quaternion: [...] }
-                                // Approximate as a bounding sphere using the halfSize magnitude as radius.
-                                if let Some(center) = obb.get("center").and_then(|c| c.as_array()) {
-                                    mbs[0] = center.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0); // lon
-                                    mbs[1] = center.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0); // lat
-                                    mbs[2] = center.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0); // z
+                                let id = match id_value {
+                                    Some(v) if v.is_string() => v.as_str().unwrap().to_string(),
+                                    Some(v) if v.is_number() => v.as_i64().unwrap().to_string(),
+                                    _ => continue,
+                                };
 
-                                    if let Some(hs) = obb.get("halfSize").and_then(|h| h.as_array()) {
-                                        let hx = hs.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                        let hy = hs.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                        let hz = hs.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                        // Radius = magnitude of half-size vector (conservative bounding sphere)
-                                        mbs[3] = (hx * hx + hy * hy + hz * hz).sqrt();
-                                    } else {
-                                        // No halfSize: can't determine a meaningful radius; keep conservatively.
-                                        mbs[3] = 999999.0;
-                                        eprintln!("[WARN] Node '{}' OBB has no halfSize; using conservative radius.", id);
+                                let node_doc_filename = if doc_filename.starts_with("nodes/") {
+                                    format!("nodes/{}/3dNodeIndexDocument.json", id)
+                                } else {
+                                    doc_filename.clone()
+                                };
+
+                                let mut mbs = [0.0f64; 4];
+                                let mut has_bounds = false;
+
+                                if let Some(mbs_arr) = node_val.get("mbs").and_then(|m| m.as_array()) {
+                                    for i in 0..4 {
+                                        mbs[i] = mbs_arr[i].as_f64().unwrap_or(0.0);
                                     }
                                     has_bounds = true;
                                 }
-                            }
 
-                            if !has_bounds {
-                                continue;
-                            }
+                                if !has_bounds { continue; }
 
-                            let mut children = Vec::new();
-
-                            if let Some(children_arr) =
-                                node_val.get("children").and_then(|c| c.as_array())
-                            {
-                                for child in children_arr {
-
-                                    // Legacy form:
-                                    // { "id": 123 }
-
-                                    if let Some(child_id) = child.get("id") {
-
-                                        let id_str =
-                                            if let Some(s) = child_id.as_str() {
-                                                Some(s.to_string())
-                                            } else if let Some(n) = child_id.as_number() {
-                                                Some(n.to_string())
-                                            } else {
-                                                None
+                                let mut children = Vec::new();
+                                if let Some(children_arr) = node_val.get("children").and_then(|c| c.as_array()) {
+                                    for child_val in children_arr {
+                                        if let Some(child_id_val) = child_val.get("id") {
+                                            let child_id = match child_id_val {
+                                                serde_json::Value::String(s) => s.clone(),
+                                                serde_json::Value::Number(n) => n.to_string(),
+                                                _ => continue,
                                             };
-
-                                        if let Some(cid) = id_str {
-                                            children.push(clip::ChildRef {
-                                                id: cid
-                                            });
+                                            children.push(ChildRef { id: child_id });
                                         }
-
-                                        continue;
                                     }
+                                }
+                                let new_node = I3SNode {
+                                    id: id.clone(),
+                                    doc_filename: node_doc_filename,
+                                    containing_doc: entry.filename.clone(),
+                                    mbs,
+                                    children,
+                                };
 
-                                    // Node-page form:
-                                    // [123,456,789]
+                                all_nodes.insert(id, new_node);
+                            }
+                        } else {
+                            eprintln!("[WARN] Failed to parse valid JSON from: {}", entry.filename);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("[ERROR] Failed to fetch content for {}: {}", entry.filename, e);
+                    }
+                }
+            }
+            
+            let node_page_count = archive_entries.iter()
+                .filter(|e| e.filename.starts_with("nodepages/"))
+                .count();
 
-                                    if let Some(n) = child.as_u64() {
-                                        children.push(clip::ChildRef {
-                                            id: n.to_string()
-                                        });
-                                        continue;
+            println!(
+                "Parsed {} I3S nodes into memory ({} node pages).",
+                all_nodes.len(),
+                node_page_count
+            );
+            clip::filter_i3s_scenelayer(&scenelayer_json, &all_nodes, &clip_polygon, &mut keep_uris, &mut kept_node_ids);
+        } else {
+            println!("Detected I3S 1.6 / flat dataset. Traversing tree lazily (Parallel)...");
+            
+            let root_node_path_str = scenelayer_json
+                .get("store")
+                .and_then(|s| s.get("rootNode"))
+                .and_then(|r| r.as_str())
+                .unwrap_or("./nodes/root");
+            let root_node_path_norm = root_node_path_str.replace('\\', "/");
+            let root_id = Path::new(&root_node_path_norm)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("root")
+                .to_string();
+
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(root_id.clone());
+
+            let mut visited = HashSet::new();
+            let mut active_fetches = FuturesUnordered::new();
+            let semaphore = Arc::new(Semaphore::new(args.concurrency));
+
+            while !queue.is_empty() || !active_fetches.is_empty() {
+                // Spawn lazy fetches up to maximum concurrency limit
+                while !queue.is_empty() && active_fetches.len() < args.concurrency {
+                    if let Some(node_id) = queue.pop_front() {
+                        if !visited.insert(node_id.clone()) {
+                            continue;
+                        }
+
+                        let client = s3_client_arc.clone();
+                        let bucket = args.bucket.clone();
+                        let key = args.key.clone();
+                        let entries = archive_entries.clone();
+                        let sem = semaphore.clone();
+
+                        let fut = async move {
+                            let _permit = sem.acquire().await.unwrap();
+                            let node_path = format!("nodes/{}/3dNodeIndexDocument.json", node_id);
+                            let node_path_gz = format!("{}.gz", node_path);
+                            
+                            let entry = entries.iter().find(|e| e.filename == node_path || e.filename == node_path_gz);
+                            let res: Result<(String, String, Vec<u8>), String> = match entry {
+                                None => Err(format!("Node {} not found in archive", node_id)),
+                                Some(e) => {
+                                    match fetch_file_content(&*client, &bucket, &key, e).await {
+                                        Err(err) => Err(format!("Failed to fetch node {}: {}", node_id, err)),
+                                        Ok(bytes) => Ok((node_id, e.filename.clone(), bytes))
                                     }
+                                }
+                            };
+                            res
+                        };
+                        active_fetches.push(tokio::spawn(fut));
+                    }
+                }
 
-                                    if let Some(s) = child.as_str() {
-                                        children.push(clip::ChildRef {
-                                            id: s.to_string()
-                                        });
+                // Handle the next fetched node response
+                if let Some(join_res) = active_fetches.next().await {
+                    match join_res {
+                        Err(join_err) => { eprintln!("[ERROR] Join error in lazy fetch: {}", join_err); }
+                        Ok(Err(fetch_err)) => {
+                            if args.debug {
+                                eprintln!("[WARN] {}", fetch_err);
+                            }
+                        }
+                        Ok(Ok((node_id, containing_doc, bytes))) => {
+                            if let Ok(node_val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                let mut mbs = [0.0f64; 4];
+                                let mut has_bounds = false;
+                                if let Some(mbs_arr) = node_val.get("mbs").and_then(|m| m.as_array()) {
+                                    if mbs_arr.len() >= 4 {
+                                        for i in 0..4 {
+                                            mbs[i] = mbs_arr[i].as_f64().unwrap_or(0.0);
+                                        }
+                                        has_bounds = true;
+                                    }
+                                }
+
+                                if !has_bounds { continue; }
+
+                                // MBS degree coordinate conversion
+                                let mbs_center_x = mbs[0];
+                                let mbs_center_y = mbs[1];
+                                let mbs_radius_meters = mbs[3];
+
+                                let lat_rad = mbs_center_y.to_radians();
+                                let meters_per_deg_lat = 111320.0;
+                                let meters_per_deg_lon = (111320.0 * lat_rad.cos()).max(1.0);
+
+                                let radius_deg_x = mbs_radius_meters / meters_per_deg_lon;
+                                let radius_deg_y = mbs_radius_meters / meters_per_deg_lat;
+
+                                let node_bbox = geo::Rect::new(
+                                    geo::Coord { x: mbs_center_x - radius_deg_x, y: mbs_center_y - radius_deg_y },
+                                    geo::Coord { x: mbs_center_x + radius_deg_x, y: mbs_center_y + radius_deg_y },
+                                );
+
+                                let polygon_bbox = match clip_polygon.bounding_rect() {
+                                    Some(rect) => rect,
+                                    None => continue,
+                                };
+
+                                let intersects = polygon_bbox.intersects(&node_bbox) && clip_polygon.intersects(&node_bbox);
+
+                                if intersects {
+                                    keep_uris.insert(containing_doc);
+                                    keep_uris.insert(format!("nodes/{}/3dNodeIndexDocument.json", node_id));
+                                    kept_node_ids.insert(node_id.clone());
+
+                                    if let Some(children_arr) = node_val.get("children").and_then(|c| c.as_array()) {
+                                        for child_val in children_arr {
+                                            if let Some(child_id_val) = child_val.get("id") {
+                                                let child_id = match child_id_val {
+                                                    serde_json::Value::String(s) => s.clone(),
+                                                    serde_json::Value::Number(n) => n.to_string(),
+                                                    _ => continue,
+                                                };
+                                                queue.push_back(child_id);
+                                            }
+                                        }
                                     }
                                 }
                             }
-                            let new_node = clip::I3SNode {
-                                id: id.clone(),
-                                doc_filename: node_doc_filename,
-                                containing_doc: doc_filename.clone(),
-                                mbs,
-                                children,
-                            };
-
-                            all_nodes
-                                .entry(id.clone())
-                                .and_modify(|existing: &mut clip::I3SNode| {
-                                    if existing.children.is_empty() {
-                                        existing.children = new_node.children.clone();
-                                    }
-                                    if existing.mbs[3] == 0.0 {
-                                        existing.mbs = new_node.mbs;
-                                    }
-                                })
-                                .or_insert(new_node);
-                        }
-                    } else {
-                        eprintln!("[WARN] Failed to parse valid JSON from: {}", entry.filename);
-                    }
-                },
-                Err(e) => {
-                    eprintln!("[ERROR] Failed to fetch content for {}: {}", entry.filename, e);
-                }
-            }
-        }
-        
-        let node_page_count = archive_entries.iter()
-            .filter(|e| e.filename.starts_with("nodepages/"))
-            .count();
-
-        println!(
-            "Parsed {} I3S nodes into memory ({} node pages).",
-            all_nodes.len(),
-            node_page_count
-        );
-        let mut kept_node_ids: HashSet<String> = HashSet::new();
-        clip::filter_i3s_scenelayer(&scenelayer_json, &all_nodes, &clip_polygon, &mut keep_uris, &mut kept_node_ids);
-
-        // --- I3S 1.7+ resource expansion ---
-        // Node-page entries carry only a compact `mesh` reference; the actual files
-        // (geometries/, textures/, attributes/, shared/, features/) live under
-        // `nodes/{id}/...`. After traversal, expand keep_uris to include every archive
-        // entry under `nodes/{kept_id}/`.
-        //
-        // We also unconditionally keep all `nodepages/*` and `statistics/*` — they are
-        // small, densely interlinked, and referenced by integer index from the scene
-        // layer; partial pruning would break the node-page lookup tables.
-        {
-            let mut node_dir_prefixes: Vec<String> = kept_node_ids
-                .iter()
-                .map(|id| format!("nodes/{}/", id))
-                .collect();
-            node_dir_prefixes.sort();
-            node_dir_prefixes.dedup();
-
-            let mut added = 0usize;
-            for entry in archive_entries.iter() {
-                let name_no_gz = entry.filename.strip_suffix(".gz").unwrap_or(&entry.filename);
-
-                let is_kept_node_resource = node_dir_prefixes
-                    .iter()
-                    .any(|p| name_no_gz.starts_with(p));
-                let is_nodepage = name_no_gz.starts_with("nodepages/");
-                let is_statistics = name_no_gz.starts_with("statistics/");
-
-                if is_kept_node_resource || is_nodepage || is_statistics {
-                    if keep_uris.insert(name_no_gz.to_string()) {
-                        added += 1;
-                    }
-                }
-            }
-            println!(
-                "Expanded I3S keep set: +{} entries (nodes/<id>/*, nodepages/*, statistics/*) for {} kept nodes.",
-                added, kept_node_ids.len()
-            );
-        }
-
-        if args.debug {
-            // Show a sample of what keep_uris resolved to, and how many actually match archive entries.
-            let archive_names: std::collections::HashSet<String> = archive_entries.iter()
-                .map(|e| e.filename.strip_suffix(".gz").unwrap_or(&e.filename).to_string())
-                .collect();
-            let matched = keep_uris.iter().filter(|u| archive_names.contains(*u)).count();
-            let unmatched: Vec<&String> = keep_uris.iter().filter(|u| !archive_names.contains(*u)).take(10).collect();
-            eprintln!("[DEBUG] keep_uris has {} entries, {} match archive entries.", keep_uris.len(), matched);
-            if !unmatched.is_empty() {
-                eprintln!("[DEBUG] Sample keep_uris with NO archive match (up to 10):");
-                for u in &unmatched { eprintln!("[DEBUG]   '{}'", u); }
-            }
-            let sample_archive: Vec<&str> = archive_entries.iter().take(5).map(|e| e.filename.as_str()).collect();
-            eprintln!("[DEBUG] Sample archive filenames: {:?}", sample_archive);
-        }
-
-    } else { // Cesium3DTiles
-        let mut in_flight = FuturesUnordered::new();
-        let mut queued: HashSet<String> = HashSet::new();
-        let root = "tileset.json".to_string();
-        keep_uris.insert(root.clone());
-        queued.insert(root.clone());
-        in_flight.push(fetch_and_clip_3dtiles_json(s3_client_arc.clone(), args.bucket.clone(), args.key.clone(), archive_entries.clone(), root, clip_polygon.clone()));
-        while let Some(result) = in_flight.next().await {
-            match result {
-                Err(e) => eprintln!("[WARN] JSON fetch failed: {}", e),
-                Ok((json_path, clipped_json, local_uris)) => {
-                    for uri in local_uris {
-                        let resolved = match clip::resolve_uri(&json_path, &uri) {
-                            Some(r) => r,
-                            None => { eprintln!("[WARN] Rejected path-traversal URI '{}' in '{}'", uri, json_path); continue; }
-                        };
-                        if keep_uris.insert(resolved.clone()) {
-                            if resolved.ends_with(".json") && !queued.contains(&resolved) {
-                                queued.insert(resolved.clone());
-                                in_flight.push(fetch_and_clip_3dtiles_json(s3_client_arc.clone(), args.bucket.clone(), args.key.clone(), archive_entries.clone(), resolved, clip_polygon.clone()));
-                            }
                         }
                     }
-                    processed_jsons.insert(json_path, clipped_json);
                 }
             }
+            println!("Lazy traversal finished. Kept {} nodes.", kept_node_ids.len());
         }
     }
     
