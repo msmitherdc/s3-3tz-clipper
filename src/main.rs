@@ -237,7 +237,7 @@ async fn fetch_and_clip_3dtiles_json(
     let json_val: serde_json::Value = serde_json::from_slice(&json_bytes)?;
 
     let mut local_uris = Vec::new();
-    let clipped_json = clip::filter_tileset(json_val, &polygon, &mut local_uris);
+    let clipped_json = clip::filter_tileset(json_val, &json_path, &polygon, &mut local_uris);
     
     Ok((json_path, clipped_json, local_uris))
 }
@@ -375,7 +375,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut keep_uris: HashSet<String> = HashSet::new();
     let mut processed_jsons: HashMap<String, serde_json::Value> = HashMap::new();
 
-    if archive_format == ArchiveFormat::EsriI3S {
+    if archive_format == ArchiveFormat::Cesium3DTiles {
+        println!("Fetching and clipping 3D Tiles dataset...");
+        
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back("tileset.json".to_string());
+        
+        let mut visited = HashSet::new();
+        
+        while let Some(json_path) = queue.pop_front() {
+            if !visited.insert(json_path.clone()) { continue; }
+            
+            match fetch_and_clip_3dtiles_json(
+                s3_client_arc.clone(),
+                args.bucket.clone(),
+                args.key.clone(),
+                archive_entries.clone(),
+                json_path.clone(),
+                clip_polygon.clone(),
+            ).await {
+                Ok((path, clipped_json, local_uris)) => {
+                    processed_jsons.insert(path.clone(), clipped_json);
+                    keep_uris.insert(path);
+                    
+                    for uri in local_uris {
+                        if uri.ends_with(".json") {
+                            // Recursively fetch nested tilesets
+                            queue.push_back(uri.clone());
+                        } else {
+                            // Mark data files (e.g., .b3dm, .glb) to be kept
+                            keep_uris.insert(uri);
+                        }
+                    }
+                },
+                Err(e) => {
+                    eprintln!("[ERROR] Failed to fetch and clip 3D Tiles JSON {}: {}", json_path, e);
+                }
+            }
+        }
+        
+        println!("Finished parsing 3D Tiles dataset. Kept {} files.", keep_uris.len());
+
+       } else if archive_format == ArchiveFormat::EsriI3S {
         let root_json_path = "3dSceneLayer.json".to_string();
         let root_entry = archive_entries.iter().find(|e| e.filename == root_json_path || e.filename == format!("{}.gz", root_json_path)).ok_or("3dSceneLayer.json[.gz] not found")?;
         
@@ -386,7 +427,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         
         let mut all_nodes = HashMap::new();
         
-        // Declare the node_doc_filter closure at the top level of this block so it is visible everywhere
         let node_doc_filter = |e: &&CdEntry| {
             let f = &e.filename;
             (f.starts_with("nodepages/") || f.contains("/nodepages/")) 
@@ -435,7 +475,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             }
 
                             for node_val in nodes_to_process {
-                                let id_value = node_val.get("id");
+                                let id_value = node_val.get("id").or_else(|| node_val.get("index"));
 
                                 let id = match id_value {
                                     Some(v) if v.is_string() => v.as_str().unwrap().to_string(),
@@ -453,10 +493,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 let mut has_bounds = false;
 
                                 if let Some(mbs_arr) = node_val.get("mbs").and_then(|m| m.as_array()) {
-                                    for i in 0..4 {
-                                        mbs[i] = mbs_arr[i].as_f64().unwrap_or(0.0);
+                                    if mbs_arr.len() >= 4 {
+                                        for i in 0..4 {
+                                            mbs[i] = mbs_arr[i].as_f64().unwrap_or(0.0);
+                                        }
+                                        has_bounds = true;
                                     }
-                                    has_bounds = true;
+                                } else if let Some(obb_obj) = node_val.get("obb").and_then(|o| o.as_object()) {
+                                    if let (Some(center), Some(half_size)) = (obb_obj.get("center").and_then(|c| c.as_array()), obb_obj.get("halfSize").and_then(|h| h.as_array())) {
+                                        if center.len() >= 3 && half_size.len() >= 3 {
+                                            mbs[0] = center[0].as_f64().unwrap_or(0.0);
+                                            mbs[1] = center[1].as_f64().unwrap_or(0.0);
+                                            mbs[2] = center[2].as_f64().unwrap_or(0.0);
+                                            let hx = half_size[0].as_f64().unwrap_or(0.0);
+                                            let hy = half_size[1].as_f64().unwrap_or(0.0);
+                                            let hz = half_size[2].as_f64().unwrap_or(0.0);
+                                            mbs[3] = (hx * hx + hy * hy + hz * hz).sqrt();
+                                            has_bounds = true;
+                                        }
+                                    }
+                                } else if let Some(obb_arr) = node_val.get("obb").and_then(|o| o.as_array()) {
+                                    if obb_arr.len() >= 6 {
+                                        mbs[0] = obb_arr[0].as_f64().unwrap_or(0.0);
+                                        mbs[1] = obb_arr[1].as_f64().unwrap_or(0.0);
+                                        mbs[2] = obb_arr[2].as_f64().unwrap_or(0.0);
+                                        let hx = obb_arr[3].as_f64().unwrap_or(0.0);
+                                        let hy = obb_arr[4].as_f64().unwrap_or(0.0);
+                                        let hz = obb_arr[5].as_f64().unwrap_or(0.0);
+                                        mbs[3] = (hx * hx + hy * hy + hz * hz).sqrt();
+                                        has_bounds = true;
+                                    }
                                 }
 
                                 if !has_bounds { continue; }
@@ -464,13 +530,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 let mut children = Vec::new();
                                 if let Some(children_arr) = node_val.get("children").and_then(|c| c.as_array()) {
                                     for child_val in children_arr {
-                                        if let Some(child_id_val) = child_val.get("id") {
-                                            let child_id = match child_id_val {
-                                                serde_json::Value::String(s) => s.clone(),
-                                                serde_json::Value::Number(n) => n.to_string(),
-                                                _ => continue,
-                                            };
-                                            children.push(ChildRef { id: child_id });
+                                        let child_id = match child_val {
+                                            serde_json::Value::Number(n) => Some(n.to_string()),
+                                            serde_json::Value::String(s) => Some(s.clone()),
+                                            serde_json::Value::Object(o) => {
+                                                o.get("id").or_else(|| o.get("index")).and_then(|v| {
+                                                    match v {
+                                                        serde_json::Value::String(s) => Some(s.clone()),
+                                                        serde_json::Value::Number(n) => Some(n.to_string()),
+                                                        _ => None
+                                                    }
+                                                })
+                                            },
+                                            _ => None
+                                        };
+                                        if let Some(cid) = child_id {
+                                            children.push(ChildRef { id: cid });
                                         }
                                     }
                                 }
@@ -527,7 +602,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let semaphore = Arc::new(Semaphore::new(args.concurrency));
 
             while !queue.is_empty() || !active_fetches.is_empty() {
-                // Spawn lazy fetches up to maximum concurrency limit
                 while !queue.is_empty() && active_fetches.len() < args.concurrency {
                     if let Some(node_id) = queue.pop_front() {
                         if !visited.insert(node_id.clone()) {
@@ -561,7 +635,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
 
-                // Handle the next fetched node response
                 if let Some(join_res) = active_fetches.next().await {
                     match join_res {
                         Err(join_err) => { eprintln!("[ERROR] Join error in lazy fetch: {}", join_err); }
@@ -579,6 +652,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                         for i in 0..4 {
                                             mbs[i] = mbs_arr[i].as_f64().unwrap_or(0.0);
                                         }
+                                        has_bounds = true;
+                                    }
+                                } else if let Some(obb_obj) = node_val.get("obb").and_then(|o| o.as_object()) {
+                                    if let (Some(center), Some(half_size)) = (obb_obj.get("center").and_then(|c| c.as_array()), obb_obj.get("halfSize").and_then(|h| h.as_array())) {
+                                        if center.len() >= 3 && half_size.len() >= 3 {
+                                            mbs[0] = center[0].as_f64().unwrap_or(0.0);
+                                            mbs[1] = center[1].as_f64().unwrap_or(0.0);
+                                            mbs[2] = center[2].as_f64().unwrap_or(0.0);
+                                            let hx = half_size[0].as_f64().unwrap_or(0.0);
+                                            let hy = half_size[1].as_f64().unwrap_or(0.0);
+                                            let hz = half_size[2].as_f64().unwrap_or(0.0);
+                                            mbs[3] = (hx * hx + hy * hy + hz * hz).sqrt();
+                                            has_bounds = true;
+                                        }
+                                    }
+                                } else if let Some(obb_arr) = node_val.get("obb").and_then(|o| o.as_array()) {
+                                    if obb_arr.len() >= 6 {
+                                        mbs[0] = obb_arr[0].as_f64().unwrap_or(0.0);
+                                        mbs[1] = obb_arr[1].as_f64().unwrap_or(0.0);
+                                        mbs[2] = obb_arr[2].as_f64().unwrap_or(0.0);
+                                        let hx = obb_arr[3].as_f64().unwrap_or(0.0);
+                                        let hy = obb_arr[4].as_f64().unwrap_or(0.0);
+                                        let hz = obb_arr[5].as_f64().unwrap_or(0.0);
+                                        mbs[3] = (hx * hx + hy * hy + hz * hz).sqrt();
                                         has_bounds = true;
                                     }
                                 }
@@ -616,13 +713,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                                     if let Some(children_arr) = node_val.get("children").and_then(|c| c.as_array()) {
                                         for child_val in children_arr {
-                                            if let Some(child_id_val) = child_val.get("id") {
-                                                let child_id = match child_id_val {
-                                                    serde_json::Value::String(s) => s.clone(),
-                                                    serde_json::Value::Number(n) => n.to_string(),
-                                                    _ => continue,
-                                                };
-                                                queue.push_back(child_id);
+                                            let child_id = match child_val {
+                                                serde_json::Value::Number(n) => Some(n.to_string()),
+                                                serde_json::Value::String(s) => Some(s.clone()),
+                                                serde_json::Value::Object(o) => {
+                                                    o.get("id").or_else(|| o.get("index")).and_then(|v| {
+                                                        match v {
+                                                            serde_json::Value::String(s) => Some(s.clone()),
+                                                            serde_json::Value::Number(n) => Some(n.to_string()),
+                                                            _ => None
+                                                        }
+                                                    })
+                                                },
+                                                _ => None
+                                            };
+                                            if let Some(cid) = child_id {
+                                                queue.push_back(cid);
                                             }
                                         }
                                     }
@@ -637,6 +743,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     
     println!("Found {} files that intersect, fetching files ...", keep_uris.len());
+        
     let out_file = AsyncFile::create(&args.output).await?;
     let mut zip_writer = ZipFileWriter::new(out_file.compat_write());
     let pb = if args.progress {

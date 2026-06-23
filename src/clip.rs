@@ -286,6 +286,7 @@ pub fn tile_intersects(tile: &JsonValue, polygon: &Polygon<f64>) -> bool {
 
 fn filter_node(
     node: &mut JsonValue,
+    base_doc_path: &str,
     polygon: &Polygon<f64>,
     keep_uris: &mut Vec<String>,
     is_root: bool,
@@ -298,19 +299,23 @@ fn filter_node(
         .and_then(|c| c.get("uri"))
         .and_then(|u| u.as_str())
     {
-        keep_uris.push(content.to_string());
+        if let Some(resolved) = resolve_uri(base_doc_path, content) {
+            keep_uris.push(resolved);
+        }
     }
     if let Some(contents) = node.get("contents").and_then(|c| c.as_array()) {
         for content in contents {
             if let Some(uri) = content.get("uri").and_then(|u| u.as_str()) {
-                keep_uris.push(uri.to_string());
+                if let Some(resolved) = resolve_uri(base_doc_path, uri) {
+                    keep_uris.push(resolved);
+                }
             }
         }
     }
     if let Some(children) = node.get_mut("children").and_then(|c| c.as_array_mut()) {
         children.retain_mut(|child| {
             if tile_intersects(child, polygon) {
-                filter_node(child, polygon, keep_uris, false);
+                filter_node(child, base_doc_path, polygon, keep_uris, false);
                 true
             } else {
                 false
@@ -321,11 +326,12 @@ fn filter_node(
 
 pub fn filter_tileset(
     mut tileset: JsonValue,
+    base_doc_path: &str,
     polygon: &Polygon<f64>,
     keep_uris: &mut Vec<String>,
 ) -> JsonValue {
     if let Some(root) = tileset.get_mut("root") {
-        filter_node(root, polygon, keep_uris, true);
+        filter_node(root, base_doc_path, polygon, keep_uris, true);
     }
     tileset
 }
