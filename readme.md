@@ -2,15 +2,15 @@
 # S3 3tz Clipper 🛰️
 ### Cloud-Optimized, Multi-Threaded 3D Tiles with 3tz index Clipping Tool
 
-`s3-3tz-clipper` is a Rust-based command-line interface (CLI) for clipping 3D Tiles (`.3tz`) archives directly over S3. Operating on any size dataset, it requires **zero local storage overhead** for the source file, using  HTTP range requests to stream only the required tiles based on a GeoJSON polygon.
+`s3-3tz-clipper` is a Rust-based command-line interface (CLI) for clipping 3D Tiles (`.3tz`) and I3S (`.spk`, `.slpk`) archives directly over S3. Operating on any size dataset, it requires **zero local storage overhead** for the source file, using  HTTP range requests to stream only the required tiles based on a GeoJSON polygon.
 
-The application features multi-threaded, concurrent S3 downloads, parallel CPU-side decompression, recursive parsing of external nested tilesets, and compliance with the Maxar `.3tz` specification (incorporating the sorted 24-byte binary index `@3dtilesIndex1@`).
+The application features multi-threaded, concurrent S3 downloads, parallel CPU-side decompression, recursive parsing of external nested tilesets, and compliance with the Maxar `.3tz` specification (incorporating the sorted 24-byte binary index `@3dtilesIndex1@`) and the ESRI `.spk` specification (`1.6+`)
 
 ---
 
 ## 🛠️ Features
 
-*   **Zero-Download Remote Reads**: Streams `.3tz` files directly from any S3 bucket. No local download of the source dataset is ever required.
+*   **Zero-Download Remote Reads**: Streams `.3tz`, `.spk` files directly from any S3 bucket. No local download of the source dataset is ever required.
 *   **Multi-Threaded Parallel Fetching**: Spawns concurrent background workers to stream and decompress multiple tiles simultaneously from S3
 *   **Parallel Decompression**: Offloads decompression tasks to CPU cores in parallel via the `flate2` crate, bypassing S3 CPU overhead.
 *   **Recursive Tileset Resolution**: Recursively resolves and filters nested external tilesets (`.json` files pointing to other `.json` files), ensuring all levels of detail are correctly mapped and clipped.
@@ -19,6 +19,7 @@ The application features multi-threaded, concurrent S3 downloads, parallel CPU-s
     *   ✅ **S2 Cells**: Full, exact support for `3DTILES_bounding_volume_S2` cell tokens.
     *   ⚠️ **oriented `box` / `sphere`**: Safely defaults to keeping the tiles to prevent accidental data loss.
 *   **`.3tz` Compliance**: Automatically generates a sorted, 24-byte record binary search index (`@3dtilesIndex1@`) as the first entry inside the output archive, and patches the ZIP Local File Headers and Central Directory CRC-32 checksums.
+* ESRI I3S (`1.6+`) support for `.spk` and `.slpk` files
 *   **UNIX Pipeline-Ready**: Accepts clipping boundaries piped directly into standard input (`stdin`).
 
 ---
