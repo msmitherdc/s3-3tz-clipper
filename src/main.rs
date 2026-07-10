@@ -873,10 +873,12 @@ async fn clip_one_archive(
     struct IndexRecord { md5hash: [u8; 16], offset: u64 }
     let mut tzindex: Vec<IndexRecord> = Vec::new();
     let mut index_header_offset = 0u64;
+    let mut index_central_header_start = 0u64;
     for i in 0..final_archive.len() {
         let file_entry = final_archive.by_index(i)?;
         if file_entry.name() == index_name {
             index_header_offset = file_entry.header_start();
+            index_central_header_start = file_entry.central_header_start();
         } else {
             let normalized_path = file_entry.name().replace('\\', "/");
             let digest = md5::compute(normalized_path.as_bytes());
@@ -895,7 +897,16 @@ async fn clip_one_archive(
     let index_payload_offset = final_archive.by_name(index_name)?.data_start().expect("Index payload offset not found");
     file.seek(SeekFrom::Start(index_payload_offset)).await?;
     file.write_all(&bindex).await?;
+    // The CRC-32 must be patched in *both* places a compliant reader might check it: the
+    // Local File Header (offset 14 past its signature/version/flags/method/modtime/moddate)
+    // and the Central Directory record for the same entry (offset 16 past its own leading
+    // fields - it additionally has a 2-byte "version made by"). Standard zip readers
+    // (Python's zipfile, unzip, etc.) validate against the Central Directory copy, not the
+    // Local File Header - patching only the latter leaves the archive looking corrupt to
+    // every reader except this tool's own index-based one.
     file.seek(SeekFrom::Start(index_header_offset + 14)).await?;
+    file.write_all(&crc32.to_le_bytes()).await?;
+    file.seek(SeekFrom::Start(index_central_header_start + 16)).await?;
     file.write_all(&crc32.to_le_bytes()).await?;
 
     println!("Success! Clipped {} -> {}", key, output_path.display());
