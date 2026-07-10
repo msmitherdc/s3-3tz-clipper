@@ -57,17 +57,19 @@ cargo zigbuild --release --target x86_64-unknown-linux-gnu
 ## 💻 Usage
 
 ```text
-s3-3tz-clipper [OPTIONS] --bucket <BUCKET> --key <KEY> --geojson <GEOJSON> --output <OUTPUT>
+s3-3tz-clipper [OPTIONS] --bucket <BUCKET> (--key <KEY> | --package <KEY>) --geojson <GEOJSON> --output <OUTPUT>
 ```
 
 | Flag | Argument | Description |
 |---|---|---|
 | `-b`, `--bucket` | `<BUCKET>` | Raw name of the S3 bucket (do not prefix with `s3://`). |
-| `-k`, `--key` | `<KEY>` | Full path to the `.3tz` file within the bucket (do not start with `/`). |
+| `-k`, `--key` | `<KEY>` | Full path to a single `.3tz`/`.slpk`/`.spk` archive within the bucket (do not start with `/`). Mutually exclusive with `--package`. |
+| `--package` | `<KEY>` | Full path to a *package* tileset.json - a bare (non-archive) JSON file whose `root.children` each reference their own separate archive via `content.uri` (as OWT/Vricon multi-content packages do). Every referenced archive is clipped independently and written under `--output` at the same relative path as its `content.uri`; the package's own tileset.json is rewritten alongside it with each surviving child's (and the root's) `region` shrunk to match. Mutually exclusive with `--key`. |
 | `-g`, `--geojson` | `<GEOJSON>` | Path to the GeoJSON boundary file, or **`-`** to read from `stdin`. |
-| `-o`, `--output` | `<OUTPUT>` | Local output path where the clipped `.3tz` file will be saved. |
+| `-o`, `--output` | `<OUTPUT>` | Output file path in `--key` mode, or output **directory** in `--package` mode. |
 | `-p`, `--progress` | | *(Optional)* Show an interactive progress bar. |
-| `-c`, `--concurrency` | `<NUM>` | *(Optional)* Max concurrent S3 downloads. Defaults to `10`. |
+| `-c`, `--concurrency` | `<NUM>` | *(Optional)* Max concurrent S3 downloads within a single archive's tile fetches. Defaults to `20`. |
+| `--archive-concurrency` | `<NUM>` | *(Optional, `--package` mode only)* Max archives clipped in parallel. Defaults to `4`. Each archive additionally uses up to `--concurrency` connections of its own, so total in-flight connections can reach `archive-concurrency * concurrency`. |
 | `-d`, `--debug` | | *(Optional)* Print verbose debugging logs. |
 
 ---
@@ -94,6 +96,18 @@ cat ~/myboundary.geojson | ./target/release/s3-3tz-clipper \
   --key "3dtiles11.3dtiles.3tz" \
   --geojson "-" \
   --output "~/myboundary.3tz" \
+  --progress
+```
+
+### Example 3: Clipping a Package Tileset
+Follows `product_package_88e0c/vricon_ste_refined/tileset.json`'s `root.children` out to each of its own per-layer archives (e.g. `terrain.3tz`, `vectors/Aeronautic/HelipadPnt.3tz`, ...), clips up to 8 of them at a time, and mirrors the same relative directory layout - plus a rewritten `tileset.json` - under `--output`:
+```bash
+./target/release/s3-3tz-clipper \
+  --bucket "mybucket" \
+  --package "owt/product_package_88e0c/vricon_ste_refined/tileset.json" \
+  --geojson "~/myboundary.geojson" \
+  --output "~/clipped_88e0c/" \
+  --archive-concurrency 8 \
   --progress
 ```
 
