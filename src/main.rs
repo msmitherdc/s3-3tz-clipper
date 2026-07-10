@@ -67,7 +67,9 @@ struct CdEntry {
     filename: String,
     header_offset: u64,
     compressed_size: u64,
-    is_deflated: bool,
+    /// Raw ZIP compression method code (8 = DEFLATE, 93 = Zstandard - what OWT/Vricon .3tz
+    /// archives actually use for every entry, 0 = stored/uncompressed).
+    comp_method: u16,
 }
 
 #[derive(Clone)]
@@ -168,7 +170,6 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
     while curr + 46 <= len {
         if &cd_bytes[curr..curr + 4] != &[0x50, 0x4b, 0x01, 0x02] { break; }
         let comp_method = u16::from_le_bytes(cd_bytes[curr + 10..curr + 12].try_into().unwrap());
-        let is_deflated = comp_method == 8;
         let mut comp_size = u32::from_le_bytes(cd_bytes[curr + 20..curr + 24].try_into().unwrap()) as u64;
         let mut uncomp_size = u32::from_le_bytes(cd_bytes[curr + 24..curr + 28].try_into().unwrap()) as u64;
         let name_len = u16::from_le_bytes(cd_bytes[curr + 28..curr + 30].try_into().unwrap()) as usize;
@@ -212,7 +213,7 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
                 }
             }
         }
-        entries.push(CdEntry { filename, header_offset, compressed_size: comp_size, is_deflated });
+        entries.push(CdEntry { filename, header_offset, compressed_size: comp_size, comp_method });
         curr += 46 + name_len + extra_len + comment_len;
     }
     entries
@@ -245,10 +246,11 @@ async fn fetch_file_content(
 
     let raw_payload = client.fetch_range(bucket, key, payload_start_offset, payload_start_offset + entry.compressed_size - 1).await?;
 
-    let file_data = if entry.is_deflated {
-        decompress_deflate(&raw_payload)?
-    } else {
-        raw_payload
+    let file_data = match entry.comp_method {
+        8 => decompress_deflate(&raw_payload)?,
+        // Zstandard - what OWT/Vricon .3tz archives actually use for every entry.
+        93 => zstd::decode_all(&raw_payload[..])?,
+        _ => raw_payload,
     };
 
     if entry.filename.ends_with(".gz") {
@@ -837,7 +839,10 @@ async fn clip_one_archive(
     drop(tx);
 
     while let Some(file) = rx.recv().await {
-        let compression = if file.filename.ends_with(".gz") { Compression::Stored } else { Compression::Deflate };
+        // Zstandard (ZIP method 93) per the 3D Tiles Archive Format v1.4 spec
+        // (https://github.com/Maxar-Public/3tz-specification) - the same method OWT/Vricon's
+        // own archives already use, and a better read-performance/size trade-off than DEFLATE.
+        let compression = if file.filename.ends_with(".gz") { Compression::Stored } else { Compression::Zstd };
         let builder = ZipEntryBuilder::new(file.filename.clone().into(), compression);
         zip_writer.write_entry_whole(builder, &file.data).await.unwrap();
         if let Some(ref bar) = pb { bar.inc(1); }
