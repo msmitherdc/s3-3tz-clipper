@@ -838,6 +838,7 @@ async fn clip_one_archive(
     }
     drop(tx);
 
+    let mut written_count: usize = 0;
     while let Some(file) = rx.recv().await {
         // Zstandard (ZIP method 93) per the 3D Tiles Archive Format v1.4 spec
         // (https://github.com/Maxar-Public/3tz-specification) - the same method OWT/Vricon's
@@ -845,6 +846,7 @@ async fn clip_one_archive(
         let compression = if file.filename.ends_with(".gz") { Compression::Stored } else { Compression::Zstd };
         let builder = ZipEntryBuilder::new(file.filename.clone().into(), compression);
         zip_writer.write_entry_whole(builder, &file.data).await.unwrap();
+        written_count += 1;
         if let Some(ref bar) = pb { bar.inc(1); }
     }
     for task in fetch_tasks { task.await.unwrap(); }
@@ -854,11 +856,13 @@ async fn clip_one_archive(
     } else {
         "@specialIndexFileHASH128@"
     };
-    // The dummy index must be at least as large as the real index written in-place later.
-    // The real index has one 24-byte record per non-index zip entry. keep_uris.len() is an
-    // upper bound (some fetches may fail), so add 1 record of slack so the slot is never
-    // too small, which would cause a truncated/corrupt index.
-    let dummy_index = vec![0u8; (keep_uris.len() + 1) * 24];
+    // The dummy index's placeholder bytes get overwritten in-place with the real index below,
+    // so it must be sized to exactly the real index's length (one 24-byte record per
+    // non-index entry) - not `keep_uris.len()` (only an upper bound: some fetches can fail
+    // and never reach the writer loop above). Sizing it any larger leaves stale zero-padding
+    // after the real index bytes, which the Local File Header still declares as part of the
+    // entry's data - producing a CRC32 mismatch against every other zip reader.
+    let dummy_index = vec![0u8; written_count * 24];
     zip_writer.write_entry_whole(ZipEntryBuilder::new(index_name.into(), Compression::Stored), &dummy_index).await?;
     zip_writer.close().await?;
     if let Some(ref bar) = pb { bar.finish_with_message("Done!"); }
