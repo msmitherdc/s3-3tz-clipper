@@ -379,8 +379,9 @@ async fn clip_one_archive(
     }
 
     if cd_size == 0 {
-        eprintln!("[ERROR] FATAL: Could not map Central Directory for '{}'. File may be corrupted or not a valid zip archive.", key);
-        return Ok(());
+        let msg = format!("Could not map Central Directory for '{}'. File may be corrupted or not a valid zip archive.", key);
+        eprintln!("[ERROR] FATAL: {}", msg);
+        return Err(msg.into());
     }
 
     println!("Fetching Central Directory ({} bytes) for {}...", cd_size, key);
@@ -896,8 +897,13 @@ async fn clip_one_archive(
 /// takes to fetch, clip, and (if it survives) rewrite its entry in the outer tileset.
 struct PackageChild {
     index: usize,
+    /// Resolved (and path-traversal-checked) relative path - safe to join onto
+    /// `base_prefix`/`output_dir` directly. See `clip::resolve_uri`.
     uri: String,
-    region: Option<[f64; 6]>,
+    /// Raw `boundingVolume.region`, if the child declared one (position-preserving - a
+    /// non-numeric component is defaulted to `0.0`, never dropped, so it can't shift the
+    /// remaining west/south/east/north/height values out of alignment).
+    region: Option<Vec<f64>>,
 }
 
 /// `--package` mode: fetch a bare package tileset.json, follow every root.children
@@ -932,6 +938,7 @@ async fn run_package(
     // the borrow of `package_json` ends before we start spawning tasks below.
     let mut candidates: Vec<PackageChild> = Vec::new();
     let mut processed_indices: HashSet<usize> = HashSet::new();
+    let mut seen_archive_keys: HashSet<String> = HashSet::new();
     {
         let children = package_json
             .get("root")
@@ -949,27 +956,39 @@ async fn run_package(
                 continue;
             }
 
-            let region: Option<[f64; 6]> = child
-                .get("boundingVolume")
-                .and_then(|b| b.get("region"))
-                .and_then(|r| r.as_array())
-                .and_then(|arr| {
-                    let vals: Vec<f64> = arr.iter().filter_map(|v| v.as_f64()).collect();
-                    if vals.len() >= 6 { Some([vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]]) } else { None }
-                });
-
             // From here on we've committed to a decision (clip it, or drop it) - anything
             // we didn't even get this far for (non-archive content) stays untouched below.
             processed_indices.insert(index);
 
-            if let Some(ref region) = region {
-                if clip::clip_region(region, &clip_polygon).is_none() {
-                    if debug { println!("[DEBUG] Archive '{}' does not intersect clip polygon; dropping.", uri); }
-                    continue;
-                }
+            // content.uri comes straight from S3-hosted, externally-produced data - reject
+            // anything that would escape the package's own directory (absolute paths, `..`
+            // escapes) the same way filter_node already does for in-archive references,
+            // rather than joining it onto output_dir unchecked.
+            let Some(resolved_uri) = clip::resolve_uri("", &uri) else {
+                eprintln!("[WARN] Dropping content.uri '{}': escapes the package's own directory.", uri);
+                continue;
+            };
+
+            // tile_intersects already handles region/S2/box/unknown boundingVolume shapes
+            // (conservatively keeping what it can't evaluate) - reuse it here instead of
+            // only ever pre-filtering region-shaped children.
+            if !clip::tile_intersects(child, &clip_polygon) {
+                if debug { println!("[DEBUG] Archive '{}' does not intersect clip polygon; dropping.", resolved_uri); }
+                continue;
             }
 
-            candidates.push(PackageChild { index, uri, region });
+            if !seen_archive_keys.insert(resolved_uri.clone()) {
+                eprintln!("[WARN] Dropping duplicate content.uri '{}': already referenced by another child.", resolved_uri);
+                continue;
+            }
+
+            let region = child
+                .get("boundingVolume")
+                .and_then(|b| b.get("region"))
+                .and_then(|r| r.as_array())
+                .map(|arr| arr.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect::<Vec<f64>>());
+
+            candidates.push(PackageChild { index, uri: resolved_uri, region });
         }
     }
 
@@ -1051,8 +1070,18 @@ async fn run_package(
         *children = retained;
     }
 
+    // Only recompute the root's region if every kept child had one to contribute - a kept
+    // child with a box/S2/missing boundingVolume has an extent we can't shrink or represent
+    // as a region, so unioning just the region-shaped children would understate the root's
+    // true extent. Leaving the original (pre-clip) region in that case is the safe default.
+    let kept_without_region = kept_indices.iter().filter(|i| !new_regions.contains_key(i)).count();
     if kept_indices.is_empty() {
         println!("[WARN] No archives in the package intersected the clip polygon.");
+    } else if kept_without_region > 0 {
+        println!(
+            "[WARN] {} kept archive(s) have no clippable `region` metadata (box/S2/missing boundingVolume); leaving the package's root boundingVolume unchanged rather than risk understating their true extent.",
+            kept_without_region
+        );
     } else if let Some(new_root_region) = clip::union_regions(&new_regions.values().cloned().collect::<Vec<_>>()) {
         if let Some(bv) = package_json.get_mut("root").and_then(|r| r.get_mut("boundingVolume")) {
             bv["region"] = serde_json::json!(new_root_region.to_vec());
@@ -1072,6 +1101,10 @@ async fn run_package(
         failures,
         output_tileset_path.display()
     );
+
+    if failures > 0 {
+        return Err(format!("{} of {} package archive(s) failed to clip", failures, kept_indices.len() + failures).into());
+    }
     Ok(())
 }
 
@@ -1083,6 +1116,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         (None, None) => panic!("Must specify either --key (a single .3tz/.slpk/.spk archive) or --package (a package tileset.json to follow)"),
         (Some(_), Some(_)) => panic!("--key and --package are mutually exclusive"),
         _ => {}
+    }
+
+    if args.package.is_some() {
+        const CONCURRENCY_WARN_THRESHOLD: usize = 200;
+        let total_connections = args.archive_concurrency.saturating_mul(args.concurrency);
+        if total_connections > CONCURRENCY_WARN_THRESHOLD {
+            eprintln!(
+                "[WARN] --archive-concurrency ({}) * --concurrency ({}) allows up to {} concurrent S3 connections, which may exhaust local sockets or trip S3 rate limits. Consider lowering one of these.",
+                args.archive_concurrency, args.concurrency, total_connections
+            );
+        }
     }
 
     if args.debug {

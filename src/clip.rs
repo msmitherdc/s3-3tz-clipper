@@ -260,17 +260,12 @@ pub fn tile_intersects(tile: &JsonValue, polygon: &Polygon<f64>) -> bool {
         }
     }
 
-    // Region bounding volume (radians → degrees).
+    // Region bounding volume (radians → degrees). Values are defaulted to 0.0 rather than
+    // dropped so a non-numeric entry can't shift the remaining west/south/east/north
+    // positions out of alignment.
     if let Some(region) = bounding_volume.get("region").and_then(|r| r.as_array()) {
-        if region.len() >= 4 {
-            let west = rad_to_deg(region[0].as_f64().unwrap_or(0.0));
-            let south = rad_to_deg(region[1].as_f64().unwrap_or(0.0));
-            let east = rad_to_deg(region[2].as_f64().unwrap_or(0.0));
-            let north = rad_to_deg(region[3].as_f64().unwrap_or(0.0));
-            let rect = Rect::new(
-                Coord { x: west, y: south },
-                Coord { x: east, y: north },
-            );
+        let values: Vec<f64> = region.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
+        if let Some((rect, _, _)) = region_to_rect(&values) {
             return polygon.intersects(&rect);
         }
     }
@@ -347,24 +342,28 @@ pub fn filter_tileset(
 // the outer tileset's own metadata doesn't keep advertising the pre-clip extent.
 
 fn deg_to_rad(deg: f64) -> f64 {
-    deg * std::f64::consts::PI / 180.0
+    deg.to_radians()
 }
 
 /// Parse a 3D Tiles `region` bounding volume (`[west, south, east, north, minHeight,
 /// maxHeight]`, first four in radians) into a degree-space `Rect` plus its original height
-/// range. Returns `None` if `region` doesn't have all six components.
+/// range. Only the first four components are required (matching `tile_intersects`'s own
+/// tolerance below, which never looks at height) - missing height components default to
+/// `0.0`. Returns `None` if `region` doesn't even have west/south/east/north.
 pub fn region_to_rect(region: &[f64]) -> Option<(Rect<f64>, f64, f64)> {
-    if region.len() < 6 {
+    if region.len() < 4 {
         return None;
     }
     let west = rad_to_deg(region[0]);
     let south = rad_to_deg(region[1]);
     let east = rad_to_deg(region[2]);
     let north = rad_to_deg(region[3]);
+    let min_height = region.get(4).copied().unwrap_or(0.0);
+    let max_height = region.get(5).copied().unwrap_or(0.0);
     Some((
         Rect::new(Coord { x: west, y: south }, Coord { x: east, y: north }),
-        region[4],
-        region[5],
+        min_height,
+        max_height,
     ))
 }
 
