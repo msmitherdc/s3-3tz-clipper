@@ -30,11 +30,28 @@ const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
 #[command(author, version, about = "Cloud-Optimized 3dtiles/I3S Clipper")]
 struct Args {
     #[arg(short, long)] bucket: String,
-    #[arg(short, long)] key: String,
+    /// Full path to a single `.3tz`/`.slpk`/`.spk` archive within the bucket. Mutually
+    /// exclusive with `--package`.
+    #[arg(short, long)] key: Option<String>,
+    /// Full path to a "package" tileset.json within the bucket - a bare (non-archive) JSON
+    /// file whose root.children each reference their own separate `.3tz`/`.slpk`/`.spk`
+    /// archive via `content.uri` (as OWT/Vricon multi-content packages do). Every referenced
+    /// archive is clipped independently, in parallel, and written under `--output` at the
+    /// same relative path as its `content.uri`; the package's own tileset.json is rewritten
+    /// alongside it with each surviving child's (and the root's) `region` shrunk to match.
+    /// Mutually exclusive with `--key`.
+    #[arg(long)] package: Option<String>,
     #[arg(short, long)] geojson: String,
+    /// Output file path in single-archive (`--key`) mode, or output directory in package
+    /// (`--package`) mode.
     #[arg(short, long)] output: String,
     #[arg(short, long)] progress: bool,
+    /// Max concurrent S3 downloads *within* a single archive's tile fetches.
     #[arg(short, long, default_value_t = 20)] concurrency: usize,
+    /// Max archives clipped in parallel in `--package` mode. Each archive additionally uses
+    /// up to `--concurrency` connections of its own, so total in-flight connections can
+    /// reach `archive_concurrency * concurrency`.
+    #[arg(long, default_value_t = 4)] archive_concurrency: usize,
     #[arg(long, default_value_t = false)] debug: bool,
     #[arg(long, default_value_t = false)] no_sign_request: bool,
 }
@@ -50,7 +67,9 @@ struct CdEntry {
     filename: String,
     header_offset: u64,
     compressed_size: u64,
-    is_deflated: bool,
+    /// Raw ZIP compression method code (8 = DEFLATE, 93 = Zstandard - what OWT/Vricon .3tz
+    /// archives actually use for every entry, 0 = stored/uncompressed).
+    comp_method: u16,
 }
 
 #[derive(Clone)]
@@ -103,6 +122,26 @@ impl S3Client {
             }
         }
     }
+
+    /// Fetch a whole object as-is (no Range header) - used for a package's own bare
+    /// tileset.json, which isn't a zip archive at all so has no Central Directory to seek
+    /// around.
+    async fn fetch_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            S3Client::Signed(client) => {
+                let resp = client.get_object().bucket(bucket).key(key).send().await?;
+                Ok(resp.body.collect().await?.into_bytes().to_vec())
+            }
+            S3Client::Unsigned(client, base_url) => {
+                let url = format!("{}/{}/{}", base_url, bucket, key);
+                let resp = client.get(&url).send().await?;
+                if !resp.status().is_success() {
+                    return Err(format!("HTTP Error: {} for url {}", resp.status(), url).into());
+                }
+                Ok(resp.bytes().await?.to_vec())
+            }
+        }
+    }
 }
 
 struct DownloadedFile {
@@ -131,7 +170,6 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
     while curr + 46 <= len {
         if &cd_bytes[curr..curr + 4] != &[0x50, 0x4b, 0x01, 0x02] { break; }
         let comp_method = u16::from_le_bytes(cd_bytes[curr + 10..curr + 12].try_into().unwrap());
-        let is_deflated = comp_method == 8;
         let mut comp_size = u32::from_le_bytes(cd_bytes[curr + 20..curr + 24].try_into().unwrap()) as u64;
         let mut uncomp_size = u32::from_le_bytes(cd_bytes[curr + 24..curr + 28].try_into().unwrap()) as u64;
         let name_len = u16::from_le_bytes(cd_bytes[curr + 28..curr + 30].try_into().unwrap()) as usize;
@@ -145,10 +183,10 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
             break;
         }
         let mut filename = std::str::from_utf8(&cd_bytes[name_start..name_end]).unwrap_or("").to_string();
-        
+
         // Normalize Windows backslashes to forward slashes
         filename = filename.replace('\\', "/");
-        
+
         if extra_len > 0 && (uncomp_size == 0xFFFFFFFF || comp_size == 0xFFFFFFFF || header_offset == 0xFFFFFFFF) {
             let extra_start = name_end;
             let extra_end = extra_start + extra_len;
@@ -175,7 +213,7 @@ fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
                 }
             }
         }
-        entries.push(CdEntry { filename, header_offset, compressed_size: comp_size, is_deflated });
+        entries.push(CdEntry { filename, header_offset, compressed_size: comp_size, comp_method });
         curr += 46 + name_len + extra_len + comment_len;
     }
     entries
@@ -208,10 +246,11 @@ async fn fetch_file_content(
 
     let raw_payload = client.fetch_range(bucket, key, payload_start_offset, payload_start_offset + entry.compressed_size - 1).await?;
 
-    let file_data = if entry.is_deflated {
-        decompress_deflate(&raw_payload)?
-    } else {
-        raw_payload
+    let file_data = match entry.comp_method {
+        8 => decompress_deflate(&raw_payload)?,
+        // Zstandard - what OWT/Vricon .3tz archives actually use for every entry.
+        93 => zstd::decode_all(&raw_payload[..])?,
+        _ => raw_payload,
     };
 
     if entry.filename.ends_with(".gz") {
@@ -232,73 +271,53 @@ async fn fetch_and_clip_3dtiles_json(
     let json_path_gz = format!("{}.gz", json_path);
     let entry = archive_entries.iter().find(|e| e.filename == json_path || e.filename == json_path_gz)
         .ok_or_else(|| format!("Missing JSON entry: {}", json_path))?;
-    
+
     let json_bytes = fetch_file_content(&*client, &bucket, &key, entry).await?;
     let json_val: serde_json::Value = serde_json::from_slice(&json_bytes)?;
 
     let mut local_uris = Vec::new();
     let clipped_json = clip::filter_tileset(json_val, &json_path, &polygon, &mut local_uris);
-    
+
     Ok((json_path, clipped_json, local_uris))
 }
 
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let args = Args::parse();
-    let archive_format = if args.key.ends_with(".3tz") {
+/// Clip a single `.3tz`/`.slpk`/`.spk` archive (whichever `key` names) against
+/// `clip_polygon`, writing the result to `output_path`. This is the entire original
+/// single-archive pipeline, factored out so both plain `--key` mode and each archive
+/// discovered via `--package` mode share the exact same logic.
+async fn clip_one_archive(
+    s3_client: Arc<S3Client>,
+    bucket: &str,
+    key: &str,
+    output_path: &Path,
+    clip_polygon: Arc<geo::Polygon<f64>>,
+    concurrency: usize,
+    progress: bool,
+    debug: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let archive_format = if key.ends_with(".3tz") {
         ArchiveFormat::Cesium3DTiles
-    } else if args.key.ends_with(".slpk") || args.key.ends_with(".spk") {
+    } else if key.ends_with(".slpk") || key.ends_with(".spk") {
         ArchiveFormat::EsriI3S
     } else {
-        panic!("Unsupported file extension. Please use .3tz, .slpk, or .spk");
+        return Err(format!("Unsupported file extension for '{}'. Please use .3tz, .slpk, or .spk", key).into());
     };
 
-    if args.debug {
-        tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("aws_config=debug,aws_sdk_s3=debug,reqwest=debug"))).init();
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
     }
-    let mut geojson_str = String::new();
-    if args.geojson == "-" {
-        std::io::stdin().read_to_string(&mut geojson_str)?;
-    } else {
-        let mut geojson_file = StdFile::open(&args.geojson)?;
-        geojson_file.read_to_string(&mut geojson_str)?;
-    }
-    let clip_polygon = Arc::new(clip::parse_geojson_polygon(&geojson_str).expect("Failed to parse GeoJSON"));
-    let custom_endpoint = std::env::var("AWS_S3_ENDPOINT")
-        .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
-        .map(|url| format!("https://{}", url))
-        .ok();
-    let s3_client = if args.no_sign_request {
-        let custom_cert = load_custom_certs()?;
-        let mut builder = reqwest::Client::builder().use_rustls_tls();
-        if let Some(cert) = custom_cert {
-            builder = builder.add_root_certificate(cert);
-        }
-        let reqwest_client = builder.build()?;
-        let base_url = custom_endpoint.unwrap_or_else(|| "https://s3.amazonaws.com".to_string());
-        if args.debug && base_url != "https://s3.amazonaws.com" {
-            println!("[DEBUG] Routing anonymous S3 requests to custom endpoint: {}", base_url);
-        }
-        S3Client::Unsigned(reqwest_client, base_url)
-    } else {
-        let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
-        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config).force_path_style(true);
-        if let Some(ref endpoint) = custom_endpoint {
-            if args.debug { println!("[DEBUG] Routing S3 SDK requests to custom endpoint: {}", endpoint); }
-            s3_config_builder = s3_config_builder.endpoint_url(endpoint);
-        }
-        S3Client::Signed(aws_sdk_s3::Client::from_conf(s3_config_builder.build()))
-    };
-    println!("Connecting to s3://{}/{}...", args.bucket, args.key);
-    let file_size = s3_client.fetch_size(&args.bucket, &args.key).await?;
+
+    println!("Connecting to s3://{}/{}...", bucket, key);
+    let file_size = s3_client.fetch_size(bucket, key).await?;
 
     let mut cd_offset = 0u64;
     let mut cd_size = 0u64;
 
     let eocd_read_size = std::cmp::min(file_size, 65536);
     let eocd_start = file_size - eocd_read_size;
-    let eocd_bytes = s3_client.fetch_range(&args.bucket, &args.key, eocd_start, file_size - 1).await?;
+    let eocd_bytes = s3_client.fetch_range(bucket, key, eocd_start, file_size - 1).await?;
     for i in (0..eocd_bytes.len().saturating_sub(22)).rev() {
         if &eocd_bytes[i..i + 4] == &[0x50, 0x4b, 0x05, 0x06] {
             cd_size = u32::from_le_bytes(eocd_bytes[i + 12..i + 16].try_into().unwrap()) as u64;
@@ -310,7 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if &eocd_bytes[i..i + 4] == &[0x50, 0x4b, 0x06, 0x07] {
             if i + 16 <= eocd_bytes.len() {
                 let zip64_eocd_offset = u64::from_le_bytes(eocd_bytes[i + 8..i + 16].try_into().unwrap()) as u64;
-                let z64_bytes = s3_client.fetch_range(&args.bucket, &args.key, zip64_eocd_offset, zip64_eocd_offset + 55).await?;
+                let z64_bytes = s3_client.fetch_range(bucket, key, zip64_eocd_offset, zip64_eocd_offset + 55).await?;
                 if z64_bytes.len() >= 56 && &z64_bytes[0..4] == &[0x50, 0x4b, 0x06, 0x06] {
                     cd_size = u64::from_le_bytes(z64_bytes[40..48].try_into().unwrap());
                     cd_offset = u64::from_le_bytes(z64_bytes[48..56].try_into().unwrap());
@@ -321,7 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     if cd_size == 0 {
-        if args.debug { println!("[DEBUG] Fast EOCD scan failed. Engaging robust seeking scanner..."); }
+        if debug { println!("[DEBUG] Fast EOCD scan failed. Engaging robust seeking scanner..."); }
         const CHUNK_SIZE: u64 = 16384;
         const MAX_EOCD_SEARCH_SIZE: u64 = 1024 * 1024;
         let search_limit = std::cmp::min(file_size, MAX_EOCD_SEARCH_SIZE);
@@ -329,21 +348,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut eocd_found = false;
         while current_pos > file_size - search_limit {
             let read_start = current_pos.saturating_sub(CHUNK_SIZE);
-            if args.debug { println!("[DEBUG] Scanning for EOCD in range: {}-{}", read_start, current_pos - 1); }
-            let buffer = s3_client.fetch_range(&args.bucket, &args.key, read_start, current_pos - 1).await?;
+            if debug { println!("[DEBUG] Scanning for EOCD in range: {}-{}", read_start, current_pos - 1); }
+            let buffer = s3_client.fetch_range(bucket, key, read_start, current_pos - 1).await?;
             for i in (0..=buffer.len().saturating_sub(22)).rev() {
                 if &buffer[i..i+4] == &[0x50, 0x4b, 0x05, 0x06] {
                     let eocd_absolute_pos = read_start + i as u64;
                     if eocd_absolute_pos >= 20 {
                         let locator_start = eocd_absolute_pos - 20;
-                        let locator_bytes = s3_client.fetch_range(&args.bucket, &args.key, locator_start, locator_start + 19).await?;
+                        let locator_bytes = s3_client.fetch_range(bucket, key, locator_start, locator_start + 19).await?;
                         if &locator_bytes[0..4] == &[0x50, 0x4b, 0x06, 0x07] {
                             let zip64_eocd_offset = u64::from_le_bytes(locator_bytes[8..16].try_into().unwrap());
-                            let z64_record_bytes = s3_client.fetch_range(&args.bucket, &args.key, zip64_eocd_offset, zip64_eocd_offset + 55).await?;
+                            let z64_record_bytes = s3_client.fetch_range(bucket, key, zip64_eocd_offset, zip64_eocd_offset + 55).await?;
                             if &z64_record_bytes[0..4] == &[0x50, 0x4b, 0x06, 0x06] {
                                 cd_size = u64::from_le_bytes(z64_record_bytes[40..48].try_into().unwrap());
                                 cd_offset = u64::from_le_bytes(z64_record_bytes[48..56].try_into().unwrap());
-                                if args.debug { println!("[DEBUG] Fallback scanner found ZIP64 EOCD. Size: {}, Offset: {}", cd_size, cd_offset); }
+                                if debug { println!("[DEBUG] Fallback scanner found ZIP64 EOCD. Size: {}, Offset: {}", cd_size, cd_offset); }
                                 eocd_found = true;
                                 break;
                             }
@@ -351,7 +370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     cd_size = u32::from_le_bytes(buffer[i+12..i+16].try_into().unwrap()) as u64;
                     cd_offset = u32::from_le_bytes(buffer[i+16..i+20].try_into().unwrap()) as u64;
-                    if args.debug { println!("[DEBUG] Fallback scanner found standard EOCD. Size: {}, Offset: {}", cd_size, cd_offset); }
+                    if debug { println!("[DEBUG] Fallback scanner found standard EOCD. Size: {}, Offset: {}", cd_size, cd_offset); }
                     eocd_found = true;
                     break;
                 }
@@ -362,34 +381,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     if cd_size == 0 {
-        eprintln!("[ERROR] FATAL: Could not map Central Directory. File may be corrupted or not a valid zip archive.");
-        return Ok(());
+        let msg = format!("Could not map Central Directory for '{}'. File may be corrupted or not a valid zip archive.", key);
+        eprintln!("[ERROR] FATAL: {}", msg);
+        return Err(msg.into());
     }
 
-    println!("Fetching Central Directory ({} bytes)...", cd_size);
-    let cd_bytes = s3_client.fetch_range(&args.bucket, &args.key, cd_offset, cd_offset + cd_size - 1).await?;
+    println!("Fetching Central Directory ({} bytes) for {}...", cd_size, key);
+    let cd_bytes = s3_client.fetch_range(bucket, key, cd_offset, cd_offset + cd_size - 1).await?;
     let archive_entries = Arc::new(parse_central_directory(&cd_bytes));
-    println!("Mapped {} file entries.", archive_entries.len());
+    println!("Mapped {} file entries in {}.", archive_entries.len(), key);
 
-    let s3_client_arc = Arc::new(s3_client.clone());
     let mut keep_uris: HashSet<String> = HashSet::new();
     let mut processed_jsons: HashMap<String, serde_json::Value> = HashMap::new();
 
     if archive_format == ArchiveFormat::Cesium3DTiles {
         println!("Fetching and clipping 3D Tiles dataset...");
-        
+
         let mut queue = std::collections::VecDeque::new();
         queue.push_back("tileset.json".to_string());
-        
+
         let mut visited = HashSet::new();
-        
+
         while let Some(json_path) = queue.pop_front() {
             if !visited.insert(json_path.clone()) { continue; }
-            
+
             match fetch_and_clip_3dtiles_json(
-                s3_client_arc.clone(),
-                args.bucket.clone(),
-                args.key.clone(),
+                s3_client.clone(),
+                bucket.to_string(),
+                key.to_string(),
                 archive_entries.clone(),
                 json_path.clone(),
                 clip_polygon.clone(),
@@ -397,7 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 Ok((path, clipped_json, local_uris)) => {
                     processed_jsons.insert(path.clone(), clipped_json);
                     keep_uris.insert(path);
-                    
+
                     for uri in local_uris {
                         if uri.ends_with(".json") {
                             // Recursively fetch nested tilesets
@@ -413,23 +432,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         }
-        
+
         println!("Finished parsing 3D Tiles dataset. Kept {} files.", keep_uris.len());
 
-       } else if archive_format == ArchiveFormat::EsriI3S {
+    } else if archive_format == ArchiveFormat::EsriI3S {
         let root_json_path = "3dSceneLayer.json".to_string();
         let root_entry = archive_entries.iter().find(|e| e.filename == root_json_path || e.filename == format!("{}.gz", root_json_path)).ok_or("3dSceneLayer.json[.gz] not found")?;
-        
+
         println!("Fetching 3dSceneLayer.json...");
-        let scenelayer_bytes = fetch_file_content(&s3_client, &args.bucket, &args.key, root_entry).await?;
+        let scenelayer_bytes = fetch_file_content(&s3_client, bucket, key, root_entry).await?;
         let scenelayer_json: serde_json::Value = serde_json::from_slice(&scenelayer_bytes)?;
         keep_uris.insert(root_json_path.clone());
-        
+
         let mut all_nodes = HashMap::new();
-        
+
         let node_doc_filter = |e: &&CdEntry| {
             let f = &e.filename;
-            (f.starts_with("nodepages/") || f.contains("/nodepages/")) 
+            (f.starts_with("nodepages/") || f.contains("/nodepages/"))
                 && (f.ends_with(".json") || f.ends_with(".json.gz"))
         };
 
@@ -443,15 +462,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if is_i3s_17 {
             println!("Fetching and parsing I3S 1.7+ node pages (Parallel)...");
             let mut fetch_tasks = FuturesUnordered::new();
-            let semaphore = Arc::new(Semaphore::new(args.concurrency));
+            let semaphore = Arc::new(Semaphore::new(concurrency));
 
             for entry in archive_entries.iter().filter(node_doc_filter) {
                 let entry_clone = entry.clone();
-                let client = s3_client_arc.clone();
-                let bucket = args.bucket.clone();
-                let key = args.key.clone();
+                let client = s3_client.clone();
+                let bucket = bucket.to_string();
+                let key = key.to_string();
                 let sem = semaphore.clone();
-                
+
                 fetch_tasks.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
                     let bytes_res = fetch_file_content(&*client, &bucket, &key, &entry_clone).await;
@@ -568,7 +587,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
             }
-            
+
             let node_page_count = archive_entries.iter()
                 .filter(|e| e.filename.starts_with("nodepages/"))
                 .count();
@@ -581,7 +600,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             clip::filter_i3s_scenelayer(&scenelayer_json, &all_nodes, &clip_polygon, &mut keep_uris, &mut kept_node_ids);
         } else {
             println!("Detected I3S 1.6 / flat dataset. Traversing tree lazily (Parallel)...");
-            
+
             let root_node_path_str = scenelayer_json
                 .get("store")
                 .and_then(|s| s.get("rootNode"))
@@ -599,18 +618,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             let mut visited = HashSet::new();
             let mut active_fetches = FuturesUnordered::new();
-            let semaphore = Arc::new(Semaphore::new(args.concurrency));
+            let semaphore = Arc::new(Semaphore::new(concurrency));
 
             while !queue.is_empty() || !active_fetches.is_empty() {
-                while !queue.is_empty() && active_fetches.len() < args.concurrency {
+                while !queue.is_empty() && active_fetches.len() < concurrency {
                     if let Some(node_id) = queue.pop_front() {
                         if !visited.insert(node_id.clone()) {
                             continue;
                         }
 
-                        let client = s3_client_arc.clone();
-                        let bucket = args.bucket.clone();
-                        let key = args.key.clone();
+                        let client = s3_client.clone();
+                        let bucket = bucket.to_string();
+                        let key = key.to_string();
                         let entries = archive_entries.clone();
                         let sem = semaphore.clone();
 
@@ -618,7 +637,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             let _permit = sem.acquire().await.unwrap();
                             let node_path = format!("nodes/{}/3dNodeIndexDocument.json", node_id);
                             let node_path_gz = format!("{}.gz", node_path);
-                            
+
                             let entry = entries.iter().find(|e| e.filename == node_path || e.filename == node_path_gz);
                             let res: Result<(String, String, Vec<u8>), String> = match entry {
                                 None => Err(format!("Node {} not found in archive", node_id)),
@@ -639,7 +658,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     match join_res {
                         Err(join_err) => { eprintln!("[ERROR] Join error in lazy fetch: {}", join_err); }
                         Ok(Err(fetch_err)) => {
-                            if args.debug {
+                            if debug {
                                 eprintln!("[WARN] {}", fetch_err);
                             }
                         }
@@ -741,18 +760,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("Lazy traversal finished. Kept {} nodes.", kept_node_ids.len());
         }
     }
-    
+
     println!("Found {} files that intersect, fetching files ...", keep_uris.len());
-        
-    let out_file = AsyncFile::create(&args.output).await?;
+
+    let out_file = AsyncFile::create(output_path).await?;
     let mut zip_writer = ZipFileWriter::new(out_file.compat_write());
-    let pb = if args.progress {
+    let pb = if progress {
         let bar = ProgressBar::new(keep_uris.len() as u64);
         bar.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}").unwrap());
         Some(Arc::new(bar))
     } else { None };
-    let semaphore = Arc::new(Semaphore::new(args.concurrency));
-    let (tx, mut rx) = mpsc::channel::<DownloadedFile>(args.concurrency * 2);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let (tx, mut rx) = mpsc::channel::<DownloadedFile>(concurrency * 2);
     let mut fetch_tasks = Vec::new();
 
     let original_filenames: HashMap<String, String> = archive_entries.iter()
@@ -764,7 +783,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         let entry = archive_entries.iter().find(|e| &e.filename == original_name).unwrap();
         let original_was_gzipped = entry.filename.ends_with(".gz");
-        
+
         if let Some(clipped_json) = processed_jsons.get(uncompressed_name) {
             let data = serde_json::to_string(clipped_json)?.into_bytes();
             let tx_clone = tx.clone();
@@ -788,9 +807,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         let entry_clone = entry.clone();
-        let client_clone = s3_client_arc.clone();
-        let bucket_clone = args.bucket.clone();
-        let key_clone = args.key.clone();
+        let client_clone = s3_client.clone();
+        let bucket_clone = bucket.to_string();
+        let key_clone = key.to_string();
         let tx_clone = tx.clone();
         let pb_clone = pb.clone();
         let semaphore_clone = semaphore.clone();
@@ -819,10 +838,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     drop(tx);
 
+    let mut written_count: usize = 0;
     while let Some(file) = rx.recv().await {
-        let compression = if file.filename.ends_with(".gz") { Compression::Stored } else { Compression::Deflate };
+        // Zstandard (ZIP method 93) per the 3D Tiles Archive Format v1.4 spec
+        // (https://github.com/Maxar-Public/3tz-specification) - the same method OWT/Vricon's
+        // own archives already use, and a better read-performance/size trade-off than DEFLATE.
+        let compression = if file.filename.ends_with(".gz") { Compression::Stored } else { Compression::Zstd };
         let builder = ZipEntryBuilder::new(file.filename.clone().into(), compression);
         zip_writer.write_entry_whole(builder, &file.data).await.unwrap();
+        written_count += 1;
         if let Some(ref bar) = pb { bar.inc(1); }
     }
     for task in fetch_tasks { task.await.unwrap(); }
@@ -832,34 +856,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         "@specialIndexFileHASH128@"
     };
-    // The dummy index must be at least as large as the real index written in-place later.
-    // The real index has one 24-byte record per non-index zip entry. keep_uris.len() is an
-    // upper bound (some fetches may fail), so add 1 record of slack so the slot is never
-    // too small, which would cause a truncated/corrupt index.
-    let dummy_index = vec![0u8; (keep_uris.len() + 1) * 24];
+    // The dummy index's placeholder bytes get overwritten in-place with the real index below,
+    // so it must be sized to exactly the real index's length (one 24-byte record per
+    // non-index entry) - not `keep_uris.len()` (only an upper bound: some fetches can fail
+    // and never reach the writer loop above). Sizing it any larger leaves stale zero-padding
+    // after the real index bytes, which the Local File Header still declares as part of the
+    // entry's data - producing a CRC32 mismatch against every other zip reader.
+    let dummy_index = vec![0u8; written_count * 24];
     zip_writer.write_entry_whole(ZipEntryBuilder::new(index_name.into(), Compression::Stored), &dummy_index).await?;
     zip_writer.close().await?;
     if let Some(ref bar) = pb { bar.finish_with_message("Done!"); }
-    println!("Adding index to zipfile ...");
-    let mut file = tokio::fs::OpenOptions::new().read(true).write(true).open(&args.output).await?;
-    let read_file = StdFile::open(&args.output)?;
+    println!("Adding index to zipfile ({})...", key);
+    let mut file = tokio::fs::OpenOptions::new().read(true).write(true).open(output_path).await?;
+    let read_file = StdFile::open(output_path)?;
     let mut final_archive = ZipArchive::new(read_file)?;
     struct IndexRecord { md5hash: [u8; 16], offset: u64 }
     let mut tzindex: Vec<IndexRecord> = Vec::new();
     let mut index_header_offset = 0u64;
+    let mut index_central_header_start = 0u64;
     for i in 0..final_archive.len() {
         let file_entry = final_archive.by_index(i)?;
         if file_entry.name() == index_name {
             index_header_offset = file_entry.header_start();
+            index_central_header_start = file_entry.central_header_start();
         } else {
             let normalized_path = file_entry.name().replace('\\', "/");
             let digest = md5::compute(normalized_path.as_bytes());
             tzindex.push(IndexRecord { md5hash: digest.0, offset: file_entry.header_start() });
         }
     }
-    
+
     tzindex.sort_by_key(|x| (u64::from_le_bytes(x.md5hash[0..8].try_into().unwrap()), u64::from_le_bytes(x.md5hash[8..16].try_into().unwrap())));
-    
+
     let mut bindex = Vec::with_capacity(tzindex.len() * 24);
     for i in tzindex {
         bindex.extend_from_slice(&i.md5hash);
@@ -869,9 +897,321 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let index_payload_offset = final_archive.by_name(index_name)?.data_start().expect("Index payload offset not found");
     file.seek(SeekFrom::Start(index_payload_offset)).await?;
     file.write_all(&bindex).await?;
+    // The CRC-32 must be patched in *both* places a compliant reader might check it: the
+    // Local File Header (offset 14 past its signature/version/flags/method/modtime/moddate)
+    // and the Central Directory record for the same entry (offset 16 past its own leading
+    // fields - it additionally has a 2-byte "version made by"). Standard zip readers
+    // (Python's zipfile, unzip, etc.) validate against the Central Directory copy, not the
+    // Local File Header - patching only the latter leaves the archive looking corrupt to
+    // every reader except this tool's own index-based one.
     file.seek(SeekFrom::Start(index_header_offset + 14)).await?;
     file.write_all(&crc32.to_le_bytes()).await?;
+    file.seek(SeekFrom::Start(index_central_header_start + 16)).await?;
+    file.write_all(&crc32.to_le_bytes()).await?;
 
-    println!("Success! Clipped dataset complete");
+    println!("Success! Clipped {} -> {}", key, output_path.display());
+    Ok(())
+}
+
+/// One archive discovered while walking a package's root.children, along with whatever it
+/// takes to fetch, clip, and (if it survives) rewrite its entry in the outer tileset.
+struct PackageChild {
+    index: usize,
+    /// Resolved (and path-traversal-checked) relative path - safe to join onto
+    /// `base_prefix`/`output_dir` directly. See `clip::resolve_uri`.
+    uri: String,
+    /// Raw `boundingVolume.region`, if the child declared one (position-preserving - a
+    /// non-numeric component is defaulted to `0.0`, never dropped, so it can't shift the
+    /// remaining west/south/east/north/height values out of alignment).
+    region: Option<Vec<f64>>,
+}
+
+/// `--package` mode: fetch a bare package tileset.json, follow every root.children
+/// `content.uri` to its own separate archive, clip each one independently (in parallel,
+/// bounded by `archive_concurrency`) into `output_dir` at the same relative path as its
+/// `content.uri`, then rewrite the package's own tileset.json alongside them with each
+/// surviving child's (and the overall root's) `region` shrunk to match - see
+/// clip::clip_region/union_regions for why that rewrite is necessary: clip_one_archive only
+/// ever touches the archive it's given, never the bare outer tileset.json that references
+/// it.
+async fn run_package(
+    s3_client: Arc<S3Client>,
+    bucket: &str,
+    package_key: &str,
+    output_dir: &Path,
+    clip_polygon: Arc<geo::Polygon<f64>>,
+    concurrency: usize,
+    archive_concurrency: usize,
+    progress: bool,
+    debug: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    println!("Fetching package tileset s3://{}/{}...", bucket, package_key);
+    let package_bytes = s3_client.fetch_object(bucket, package_key).await?;
+    let mut package_json: serde_json::Value = serde_json::from_slice(&package_bytes)?;
+
+    let base_prefix = match package_key.rfind('/') {
+        Some(i) => package_key[..=i].to_string(),
+        None => String::new(),
+    };
+
+    // First pass (read-only): decide which children are worth fetching at all, scoped so
+    // the borrow of `package_json` ends before we start spawning tasks below.
+    let mut candidates: Vec<PackageChild> = Vec::new();
+    let mut processed_indices: HashSet<usize> = HashSet::new();
+    let mut seen_archive_keys: HashSet<String> = HashSet::new();
+    {
+        let children = package_json
+            .get("root")
+            .and_then(|r| r.get("children"))
+            .and_then(|c| c.as_array())
+            .ok_or("Package tileset has no root.children to follow")?;
+
+        for (index, child) in children.iter().enumerate() {
+            let uri = match child.get("content").and_then(|c| c.get("uri")).and_then(|u| u.as_str()) {
+                Some(u) => u.to_string(),
+                None => continue,
+            };
+            if !(uri.ends_with(".3tz") || uri.ends_with(".slpk") || uri.ends_with(".spk")) {
+                if debug { println!("[DEBUG] Skipping non-archive content.uri: {}", uri); }
+                continue;
+            }
+
+            // From here on we've committed to a decision (clip it, or drop it) - anything
+            // we didn't even get this far for (non-archive content) stays untouched below.
+            processed_indices.insert(index);
+
+            // content.uri comes straight from S3-hosted, externally-produced data - reject
+            // anything that would escape the package's own directory (absolute paths, `..`
+            // escapes) the same way filter_node already does for in-archive references,
+            // rather than joining it onto output_dir unchecked.
+            let Some(resolved_uri) = clip::resolve_uri("", &uri) else {
+                eprintln!("[WARN] Dropping content.uri '{}': escapes the package's own directory.", uri);
+                continue;
+            };
+
+            // tile_intersects already handles region/S2/box/unknown boundingVolume shapes
+            // (conservatively keeping what it can't evaluate) - reuse it here instead of
+            // only ever pre-filtering region-shaped children.
+            if !clip::tile_intersects(child, &clip_polygon) {
+                if debug { println!("[DEBUG] Archive '{}' does not intersect clip polygon; dropping.", resolved_uri); }
+                continue;
+            }
+
+            if !seen_archive_keys.insert(resolved_uri.clone()) {
+                eprintln!("[WARN] Dropping duplicate content.uri '{}': already referenced by another child.", resolved_uri);
+                continue;
+            }
+
+            let region = child
+                .get("boundingVolume")
+                .and_then(|b| b.get("region"))
+                .and_then(|r| r.as_array())
+                .map(|arr| arr.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect::<Vec<f64>>());
+
+            candidates.push(PackageChild { index, uri: resolved_uri, region });
+        }
+    }
+
+    println!(
+        "Clipping {} archive(s) referenced by the package tileset (up to {} in parallel)...",
+        candidates.len(),
+        archive_concurrency
+    );
+    tokio::fs::create_dir_all(output_dir).await?;
+
+    let semaphore = Arc::new(Semaphore::new(archive_concurrency));
+    let mut tasks = FuturesUnordered::new();
+
+    for candidate in candidates {
+        let archive_key = format!("{}{}", base_prefix, candidate.uri);
+        let output_path = output_dir.join(&candidate.uri);
+        let client = s3_client.clone();
+        let bucket = bucket.to_string();
+        let polygon = clip_polygon.clone();
+        let sem = semaphore.clone();
+
+        tasks.push(tokio::spawn(async move {
+            let _permit = sem.acquire_owned().await.unwrap();
+            let result = clip_one_archive(
+                client,
+                &bucket,
+                &archive_key,
+                &output_path,
+                polygon,
+                concurrency,
+                progress,
+                debug,
+            ).await;
+            (candidate.index, candidate.uri, candidate.region, result)
+        }));
+    }
+
+    let mut new_regions: HashMap<usize, [f64; 6]> = HashMap::new();
+    let mut kept_indices: HashSet<usize> = HashSet::new();
+    let mut failures = 0usize;
+
+    while let Some(joined) = tasks.next().await {
+        let (index, uri, region, result) = joined?;
+        match result {
+            Ok(()) => {
+                if let Some(new_region) = region.as_ref().and_then(|r| clip::clip_region(r, &clip_polygon)) {
+                    new_regions.insert(index, new_region);
+                }
+                kept_indices.insert(index);
+            }
+            Err(e) => {
+                failures += 1;
+                eprintln!("[ERROR] Failed to clip archive '{}': {}", uri, e);
+            }
+        }
+    }
+
+    {
+        let children = package_json
+            .get_mut("root")
+            .and_then(|r| r.get_mut("children"))
+            .and_then(|c| c.as_array_mut())
+            .ok_or("Package tileset has no root.children to follow")?;
+
+        let mut retained = Vec::new();
+        for (index, mut child) in children.drain(..).enumerate() {
+            // Only drop children we actually attempted and which didn't survive - anything
+            // we never touched (non-archive content) is kept exactly as it was.
+            if processed_indices.contains(&index) && !kept_indices.contains(&index) {
+                continue;
+            }
+            if let Some(new_region) = new_regions.get(&index) {
+                if let Some(bv) = child.get_mut("boundingVolume") {
+                    bv["region"] = serde_json::json!(new_region.to_vec());
+                }
+            }
+            retained.push(child);
+        }
+        *children = retained;
+    }
+
+    // Only recompute the root's region if every kept child had one to contribute - a kept
+    // child with a box/S2/missing boundingVolume has an extent we can't shrink or represent
+    // as a region, so unioning just the region-shaped children would understate the root's
+    // true extent. Leaving the original (pre-clip) region in that case is the safe default.
+    let kept_without_region = kept_indices.iter().filter(|i| !new_regions.contains_key(i)).count();
+    if kept_indices.is_empty() {
+        println!("[WARN] No archives in the package intersected the clip polygon.");
+    } else if kept_without_region > 0 {
+        println!(
+            "[WARN] {} kept archive(s) have no clippable `region` metadata (box/S2/missing boundingVolume); leaving the package's root boundingVolume unchanged rather than risk understating their true extent.",
+            kept_without_region
+        );
+    } else if let Some(new_root_region) = clip::union_regions(&new_regions.values().cloned().collect::<Vec<_>>()) {
+        if let Some(bv) = package_json.get_mut("root").and_then(|r| r.get_mut("boundingVolume")) {
+            bv["region"] = serde_json::json!(new_root_region.to_vec());
+        }
+    }
+
+    let output_name = match package_key.rfind('/') {
+        Some(i) => &package_key[i + 1..],
+        None => package_key,
+    };
+    let output_tileset_path = output_dir.join(output_name);
+    tokio::fs::write(&output_tileset_path, serde_json::to_vec_pretty(&package_json)?).await?;
+
+    println!(
+        "Package clip complete: {} archive(s) kept, {} failed. Wrote {}",
+        kept_indices.len(),
+        failures,
+        output_tileset_path.display()
+    );
+
+    if failures > 0 {
+        return Err(format!("{} of {} package archive(s) failed to clip", failures, kept_indices.len() + failures).into());
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let args = Args::parse();
+
+    match (&args.key, &args.package) {
+        (None, None) => panic!("Must specify either --key (a single .3tz/.slpk/.spk archive) or --package (a package tileset.json to follow)"),
+        (Some(_), Some(_)) => panic!("--key and --package are mutually exclusive"),
+        _ => {}
+    }
+
+    if args.package.is_some() {
+        const CONCURRENCY_WARN_THRESHOLD: usize = 200;
+        let total_connections = args.archive_concurrency.saturating_mul(args.concurrency);
+        if total_connections > CONCURRENCY_WARN_THRESHOLD {
+            eprintln!(
+                "[WARN] --archive-concurrency ({}) * --concurrency ({}) allows up to {} concurrent S3 connections, which may exhaust local sockets or trip S3 rate limits. Consider lowering one of these.",
+                args.archive_concurrency, args.concurrency, total_connections
+            );
+        }
+    }
+
+    if args.debug {
+        tracing_subscriber::fmt().with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("aws_config=debug,aws_sdk_s3=debug,reqwest=debug"))).init();
+    }
+    let mut geojson_str = String::new();
+    if args.geojson == "-" {
+        std::io::stdin().read_to_string(&mut geojson_str)?;
+    } else {
+        let mut geojson_file = StdFile::open(&args.geojson)?;
+        geojson_file.read_to_string(&mut geojson_str)?;
+    }
+    let clip_polygon = Arc::new(clip::parse_geojson_polygon(&geojson_str).expect("Failed to parse GeoJSON"));
+    let custom_endpoint = std::env::var("AWS_S3_ENDPOINT")
+        .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+        .map(|url| format!("https://{}", url))
+        .ok();
+    let s3_client = if args.no_sign_request {
+        let custom_cert = load_custom_certs()?;
+        let mut builder = reqwest::Client::builder().use_rustls_tls();
+        if let Some(cert) = custom_cert {
+            builder = builder.add_root_certificate(cert);
+        }
+        let reqwest_client = builder.build()?;
+        let base_url = custom_endpoint.unwrap_or_else(|| "https://s3.amazonaws.com".to_string());
+        if args.debug && base_url != "https://s3.amazonaws.com" {
+            println!("[DEBUG] Routing anonymous S3 requests to custom endpoint: {}", base_url);
+        }
+        S3Client::Unsigned(reqwest_client, base_url)
+    } else {
+        let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+        let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config).force_path_style(true);
+        if let Some(ref endpoint) = custom_endpoint {
+            if args.debug { println!("[DEBUG] Routing S3 SDK requests to custom endpoint: {}", endpoint); }
+            s3_config_builder = s3_config_builder.endpoint_url(endpoint);
+        }
+        S3Client::Signed(aws_sdk_s3::Client::from_conf(s3_config_builder.build()))
+    };
+    let s3_client = Arc::new(s3_client);
+
+    if let Some(ref package_key) = args.package {
+        run_package(
+            s3_client,
+            &args.bucket,
+            package_key,
+            Path::new(&args.output),
+            clip_polygon,
+            args.concurrency,
+            args.archive_concurrency,
+            args.progress,
+            args.debug,
+        ).await?;
+        return Ok(());
+    }
+
+    let key = args.key.as_ref().unwrap();
+    clip_one_archive(
+        s3_client,
+        &args.bucket,
+        key,
+        Path::new(&args.output),
+        clip_polygon,
+        args.concurrency,
+        args.progress,
+        args.debug,
+    ).await?;
     Ok(())
 }

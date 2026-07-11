@@ -260,17 +260,12 @@ pub fn tile_intersects(tile: &JsonValue, polygon: &Polygon<f64>) -> bool {
         }
     }
 
-    // Region bounding volume (radians → degrees).
+    // Region bounding volume (radians → degrees). Values are defaulted to 0.0 rather than
+    // dropped so a non-numeric entry can't shift the remaining west/south/east/north
+    // positions out of alignment.
     if let Some(region) = bounding_volume.get("region").and_then(|r| r.as_array()) {
-        if region.len() >= 4 {
-            let west = rad_to_deg(region[0].as_f64().unwrap_or(0.0));
-            let south = rad_to_deg(region[1].as_f64().unwrap_or(0.0));
-            let east = rad_to_deg(region[2].as_f64().unwrap_or(0.0));
-            let north = rad_to_deg(region[3].as_f64().unwrap_or(0.0));
-            let rect = Rect::new(
-                Coord { x: west, y: south },
-                Coord { x: east, y: north },
-            );
+        let values: Vec<f64> = region.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect();
+        if let Some((rect, _, _)) = region_to_rect(&values) {
             return polygon.intersects(&rect);
         }
     }
@@ -334,4 +329,85 @@ pub fn filter_tileset(
         filter_node(root, base_doc_path, polygon, keep_uris, true);
     }
     tileset
+}
+
+// --- Package Tileset Clipping Logic ---
+//
+// A "package" tileset.json (as produced by OWT/Vricon) isn't itself a `.3tz`/`.spk`
+// archive - it's a bare JSON file whose root.children each point (via `content.uri`) at an
+// entirely separate, independently-indexed archive. filter_tileset/filter_node above only
+// prune an archive's own internal children; they never touch the root node's own
+// boundingVolume. The functions below let a caller shrink a package's per-child (and
+// overall root) `region` after each referenced archive has been clipped independently, so
+// the outer tileset's own metadata doesn't keep advertising the pre-clip extent.
+
+fn deg_to_rad(deg: f64) -> f64 {
+    deg.to_radians()
+}
+
+/// Parse a 3D Tiles `region` bounding volume (`[west, south, east, north, minHeight,
+/// maxHeight]`, first four in radians) into a degree-space `Rect` plus its original height
+/// range. Only the first four components are required (matching `tile_intersects`'s own
+/// tolerance below, which never looks at height) - missing height components default to
+/// `0.0`. Returns `None` if `region` doesn't even have west/south/east/north.
+pub fn region_to_rect(region: &[f64]) -> Option<(Rect<f64>, f64, f64)> {
+    if region.len() < 4 {
+        return None;
+    }
+    let west = rad_to_deg(region[0]);
+    let south = rad_to_deg(region[1]);
+    let east = rad_to_deg(region[2]);
+    let north = rad_to_deg(region[3]);
+    let min_height = region.get(4).copied().unwrap_or(0.0);
+    let max_height = region.get(5).copied().unwrap_or(0.0);
+    Some((
+        Rect::new(Coord { x: west, y: south }, Coord { x: east, y: north }),
+        min_height,
+        max_height,
+    ))
+}
+
+/// Shrink a `region` bounding volume down to its overlap with the clip polygon's bounding
+/// box, keeping the original height range unchanged (a 2D clip polygon says nothing about
+/// vertical extent). Returns `None` if the region doesn't intersect the polygon at all -
+/// the caller should drop whatever referenced this region (it has nothing left to keep).
+pub fn clip_region(region: &[f64], polygon: &Polygon<f64>) -> Option<[f64; 6]> {
+    let (rect, min_height, max_height) = region_to_rect(region)?;
+    if !polygon.intersects(&rect) {
+        return None;
+    }
+    let polygon_bbox = polygon.bounding_rect()?;
+    let west = rect.min().x.max(polygon_bbox.min().x);
+    let south = rect.min().y.max(polygon_bbox.min().y);
+    let east = rect.max().x.min(polygon_bbox.max().x);
+    let north = rect.max().y.min(polygon_bbox.max().y);
+    // Guard against a degenerate (edge-touching-only) overlap collapsing to zero area.
+    if west >= east || south >= north {
+        return None;
+    }
+    Some([
+        deg_to_rad(west),
+        deg_to_rad(south),
+        deg_to_rad(east),
+        deg_to_rad(north),
+        min_height,
+        max_height,
+    ])
+}
+
+/// Recompute a whole-tileset `region` as the envelope of its children's own (already
+/// clipped) `region`s - used to rewrite a package's own root-level boundingVolume once
+/// every referenced archive has been clipped independently.
+pub fn union_regions(regions: &[[f64; 6]]) -> Option<[f64; 6]> {
+    let mut iter = regions.iter();
+    let mut acc = *iter.next()?;
+    for r in iter {
+        acc[0] = acc[0].min(r[0]);
+        acc[1] = acc[1].min(r[1]);
+        acc[2] = acc[2].max(r[2]);
+        acc[3] = acc[3].max(r[3]);
+        acc[4] = acc[4].min(r[4]);
+        acc[5] = acc[5].max(r[5]);
+    }
+    Some(acc)
 }
