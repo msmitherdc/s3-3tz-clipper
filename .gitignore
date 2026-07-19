@@ -1,1 +1,4 @@
 target/
+clipped-*.3tz
+clipped-*.spk
+*_clip.geojson

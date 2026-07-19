@@ -33,6 +33,13 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
+      # aws-lc-rs (the AWS SDK's default TLS crypto provider since we moved off the
+      # legacy rustls 0.21 stack) builds C sources at compile time and needs cmake +
+      # a C compiler. ubuntu-latest preinstalls both, but install explicitly so the
+      # job doesn't silently break if the runner image changes.
+      - name: Install aws-lc-rs build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+
       # Caching speeds up subsequent builds
       - name: Cache Cargo Registry & Build Output
         uses: actions/cache@v3
@@ -62,7 +69,10 @@ jobs:
       #     aws-region: ${{ env.AWS_REGION }}
 
       - name: Compile Application
-        run: cargo build --release 
+        run: cargo build --release
+
+      - name: Run Unit Tests
+        run: cargo test
 
       - name: Run Test Script
         run: |

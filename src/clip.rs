@@ -41,32 +41,18 @@ pub fn parse_geojson_polygon(geojson_str: &str) -> Option<Polygon<f64>> {
             .map(GeoJson::from)
     })?;
 
+    // TryFrom errors (and thus yields None) for any non-Polygon geometry.
+    fn polygon_of(geometry: &geojson::Geometry) -> Option<Polygon<f64>> {
+        Polygon::try_from(&geometry.value).ok()
+    }
+
     match geojson {
-        GeoJson::FeatureCollection(collection) => {
-            collection.features.into_iter().find_map(|feature| {
-                feature.geometry.and_then(|geometry| {
-                    if let geojson::Value::Polygon(poly) = geometry.value {
-                        Polygon::try_from(geojson::Value::Polygon(poly)).ok()
-                    } else {
-                        None
-                    }
-                })
-            })
-        }
-        GeoJson::Feature(feature) => feature.geometry.and_then(|geometry| {
-            if let geojson::Value::Polygon(poly) = geometry.value {
-                Polygon::try_from(geojson::Value::Polygon(poly)).ok()
-            } else {
-                None
-            }
-        }),
-        GeoJson::Geometry(geometry) => {
-            if let geojson::Value::Polygon(poly) = geometry.value {
-                Polygon::try_from(geojson::Value::Polygon(poly)).ok()
-            } else {
-                None
-            }
-        }
+        GeoJson::FeatureCollection(collection) => collection
+            .features
+            .into_iter()
+            .find_map(|feature| feature.geometry.as_ref().and_then(polygon_of)),
+        GeoJson::Feature(feature) => feature.geometry.as_ref().and_then(polygon_of),
+        GeoJson::Geometry(geometry) => polygon_of(&geometry),
     }
 }
 
@@ -231,6 +217,55 @@ pub fn filter_i3s_scenelayer(
     }
 }
 
+/// Expand an I3S keep set with every archive entry belonging to a kept node.
+///
+/// Node documents / node-page entries only carry compact references; the actual payload
+/// files (geometries/, textures/, attributes/, features/, shared/, …) live under
+/// `nodes/{id}/...`. After traversal, every entry under a kept node's directory must be
+/// retained or the clipped archive has no renderable content.
+///
+/// `nodepages/*` and `statistics/*` entries are kept unconditionally — they are small,
+/// densely interlinked, and referenced by integer index from the scene layer, so partial
+/// pruning would break the node-page lookup tables. Root-level `metadata.json` (required
+/// by several SLPK readers) is kept too when present.
+///
+/// `entry_names` should be the archive entry names *without* any `.gz` suffix. Returns the
+/// number of names newly added to `keep_uris`.
+pub fn expand_i3s_keep_set<'a, I>(
+    entry_names: I,
+    kept_node_ids: &HashSet<String>,
+    keep_uris: &mut HashSet<String>,
+) -> usize
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    // Extract the node id from a path shaped like "[prefix/]nodes/{id}/...".
+    fn node_id_of(name: &str) -> Option<&str> {
+        let idx = if let Some(rest) = name.strip_prefix("nodes/") {
+            return rest.split('/').next().filter(|s| !s.is_empty());
+        } else {
+            name.find("/nodes/")? + "/nodes/".len()
+        };
+        name[idx..].split('/').next().filter(|s| !s.is_empty())
+    }
+
+    let mut added = 0usize;
+    for name in entry_names {
+        let is_kept_node_resource = node_id_of(name)
+            .is_some_and(|id| kept_node_ids.contains(id));
+        let is_nodepage = name.starts_with("nodepages/") || name.contains("/nodepages/");
+        let is_statistics = name.starts_with("statistics/") || name.contains("/statistics/");
+        let is_root_metadata = name == "metadata.json";
+
+        if (is_kept_node_resource || is_nodepage || is_statistics || is_root_metadata)
+            && keep_uris.insert(name.to_string())
+        {
+            added += 1;
+        }
+    }
+    added
+}
+
 // --- 3D Tiles Clipping Logic ---
 
 pub fn tile_intersects(tile: &JsonValue, polygon: &Polygon<f64>) -> bool {
@@ -289,9 +324,10 @@ fn filter_node(
     if !is_root && !tile_intersects(node, polygon) {
         return;
     }
+    // Pre-1.0 tilesets (asset.version "0.0") use `content.url`; 1.0+ uses `content.uri`.
     if let Some(content) = node
         .get("content")
-        .and_then(|c| c.get("uri"))
+        .and_then(|c| c.get("uri").or_else(|| c.get("url")))
         .and_then(|u| u.as_str())
     {
         if let Some(resolved) = resolve_uri(base_doc_path, content) {
@@ -300,7 +336,7 @@ fn filter_node(
     }
     if let Some(contents) = node.get("contents").and_then(|c| c.as_array()) {
         for content in contents {
-            if let Some(uri) = content.get("uri").and_then(|u| u.as_str()) {
+            if let Some(uri) = content.get("uri").or_else(|| content.get("url")).and_then(|u| u.as_str()) {
                 if let Some(resolved) = resolve_uri(base_doc_path, uri) {
                     keep_uris.push(resolved);
                 }
@@ -410,4 +446,291 @@ pub fn union_regions(regions: &[[f64; 6]]) -> Option<[f64; 6]> {
         acc[5] = acc[5].max(r[5]);
     }
     Some(acc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Unit square polygon from (0,0) to (1,1) in degrees.
+    fn unit_polygon() -> Polygon<f64> {
+        Polygon::new(
+            LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]),
+            vec![],
+        )
+    }
+
+    // --- parse_geojson_polygon ---
+
+    #[test]
+    fn parses_feature_collection_feature_and_geometry() {
+        let poly = r#"{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}"#;
+        let feature = format!(r#"{{"type":"Feature","properties":{{}},"geometry":{poly}}}"#);
+        let collection = format!(r#"{{"type":"FeatureCollection","features":[{feature}]}}"#);
+        for input in [poly.to_string(), feature, collection] {
+            let parsed = parse_geojson_polygon(&input);
+            assert!(parsed.is_some(), "failed to parse: {input}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_and_non_polygon_geojson() {
+        assert!(parse_geojson_polygon("not json").is_none());
+        assert!(parse_geojson_polygon(r#"{"type":"Point","coordinates":[0,0]}"#).is_none());
+    }
+
+    // --- resolve_uri ---
+
+    #[test]
+    fn resolve_uri_relative_forms() {
+        assert_eq!(resolve_uri("tileset.json", "tiles/0.b3dm").unwrap(), "tiles/0.b3dm");
+        assert_eq!(resolve_uri("sub/tileset.json", "./0.b3dm").unwrap(), "sub/0.b3dm");
+        assert_eq!(resolve_uri("nodes/1/doc.json", "../2/geometry.bin").unwrap(), "nodes/2/geometry.bin");
+        assert_eq!(resolve_uri("a\\b\\doc.json", "c.bin").unwrap(), "a/b/c.bin");
+    }
+
+    #[test]
+    fn resolve_uri_rejects_escapes() {
+        assert!(resolve_uri("tileset.json", "../outside.b3dm").is_none());
+        assert!(resolve_uri("sub/doc.json", "../../outside.b3dm").is_none());
+        assert!(resolve_uri("", "../escape").is_none());
+    }
+
+    // --- region_to_rect / clip_region / union_regions ---
+
+    #[test]
+    fn region_to_rect_requires_four_components() {
+        assert!(region_to_rect(&[0.0, 0.0, 0.1]).is_none());
+        let (rect, min_h, max_h) = region_to_rect(&[0.0, 0.0, 0.01, 0.01]).unwrap();
+        assert!(rect.max().x > 0.0);
+        assert_eq!((min_h, max_h), (0.0, 0.0));
+        let (_, min_h, max_h) = region_to_rect(&[0.0, 0.0, 0.01, 0.01, -5.0, 120.0]).unwrap();
+        assert_eq!((min_h, max_h), (-5.0, 120.0));
+    }
+
+    #[test]
+    fn clip_region_shrinks_and_preserves_heights() {
+        // Region spanning (-1,-1)..(2,2) degrees, clipped by the unit square.
+        let region = [
+            deg_to_rad(-1.0), deg_to_rad(-1.0), deg_to_rad(2.0), deg_to_rad(2.0),
+            -10.0, 500.0,
+        ];
+        let clipped = clip_region(&region, &unit_polygon()).unwrap();
+        assert!((rad_to_deg(clipped[0]) - 0.0).abs() < 1e-9);
+        assert!((rad_to_deg(clipped[1]) - 0.0).abs() < 1e-9);
+        assert!((rad_to_deg(clipped[2]) - 1.0).abs() < 1e-9);
+        assert!((rad_to_deg(clipped[3]) - 1.0).abs() < 1e-9);
+        assert_eq!(clipped[4], -10.0);
+        assert_eq!(clipped[5], 500.0);
+    }
+
+    #[test]
+    fn clip_region_disjoint_or_degenerate_returns_none() {
+        let far_away = [deg_to_rad(10.0), deg_to_rad(10.0), deg_to_rad(11.0), deg_to_rad(11.0), 0.0, 0.0];
+        assert!(clip_region(&far_away, &unit_polygon()).is_none());
+        // Shares only the edge x=1 with the unit square -> zero-area overlap.
+        let touching = [deg_to_rad(1.0), deg_to_rad(0.0), deg_to_rad(2.0), deg_to_rad(1.0), 0.0, 0.0];
+        assert!(clip_region(&touching, &unit_polygon()).is_none());
+    }
+
+    #[test]
+    fn union_regions_envelopes() {
+        assert!(union_regions(&[]).is_none());
+        let a = [0.0, 0.0, 1.0, 1.0, -5.0, 10.0];
+        let b = [-1.0, 0.5, 0.5, 2.0, 0.0, 50.0];
+        assert_eq!(union_regions(&[a, b]).unwrap(), [-1.0, 0.0, 1.0, 2.0, -5.0, 50.0]);
+    }
+
+    // --- tile_intersects ---
+
+    #[test]
+    fn tile_intersects_region_in_and_out() {
+        let inside = json!({"boundingVolume": {"region": [
+            deg_to_rad(0.25), deg_to_rad(0.25), deg_to_rad(0.75), deg_to_rad(0.75), 0.0, 100.0
+        ]}});
+        let outside = json!({"boundingVolume": {"region": [
+            deg_to_rad(5.0), deg_to_rad(5.0), deg_to_rad(6.0), deg_to_rad(6.0), 0.0, 100.0
+        ]}});
+        assert!(tile_intersects(&inside, &unit_polygon()));
+        assert!(!tile_intersects(&outside, &unit_polygon()));
+    }
+
+    #[test]
+    fn tile_intersects_conservative_cases() {
+        // box volumes and unknown volume types are kept conservatively
+        assert!(tile_intersects(&json!({"boundingVolume": {"box": vec![0.0; 12]}}), &unit_polygon()));
+        assert!(tile_intersects(&json!({"boundingVolume": {"sphere": [0, 0, 0, 1]}}), &unit_polygon()));
+        // no boundingVolume at all -> not kept
+        assert!(!tile_intersects(&json!({"content": {"uri": "x.b3dm"}}), &unit_polygon()));
+    }
+
+    // --- filter_tileset ---
+
+    fn region_deg(w: f64, s: f64, e: f64, n: f64) -> serde_json::Value {
+        json!([deg_to_rad(w), deg_to_rad(s), deg_to_rad(e), deg_to_rad(n), 0.0, 10.0])
+    }
+
+    #[test]
+    fn filter_tileset_prunes_children_and_collects_uris() {
+        let tileset = json!({
+            "root": {
+                "boundingVolume": {"region": region_deg(-2.0, -2.0, 3.0, 3.0)},
+                "content": {"uri": "root.b3dm"},
+                "children": [
+                    {
+                        "boundingVolume": {"region": region_deg(0.2, 0.2, 0.8, 0.8)},
+                        "content": {"uri": "tiles/in.b3dm"},
+                        "children": []
+                    },
+                    {
+                        "boundingVolume": {"region": region_deg(5.0, 5.0, 6.0, 6.0)},
+                        "content": {"uri": "tiles/out.b3dm"},
+                        "children": []
+                    },
+                    {
+                        "boundingVolume": {"region": region_deg(0.0, 0.0, 1.0, 0.5)},
+                        "contents": [{"uri": "tiles/multi1.glb"}, {"uri": "sub/nested-tileset.json"}]
+                    }
+                ]
+            }
+        });
+        let mut keep = Vec::new();
+        let out = filter_tileset(tileset, "tileset.json", &unit_polygon(), &mut keep);
+        let children = out["root"]["children"].as_array().unwrap();
+        assert_eq!(children.len(), 2, "non-intersecting child must be pruned");
+        assert!(keep.contains(&"root.b3dm".to_string()));
+        assert!(keep.contains(&"tiles/in.b3dm".to_string()));
+        assert!(!keep.contains(&"tiles/out.b3dm".to_string()));
+        assert!(keep.contains(&"tiles/multi1.glb".to_string()));
+        assert!(keep.contains(&"sub/nested-tileset.json".to_string()));
+    }
+
+    #[test]
+    fn filter_tileset_supports_pre10_content_url() {
+        // Pre-1.0 tilesets (asset.version "0.0", e.g. OWT/Vricon exports) reference tile
+        // payloads via `content.url`, not `content.uri`. Regression: these produced
+        // clipped archives with zero tile content.
+        let tileset = json!({
+            "asset": {"version": "0.0"},
+            "root": {
+                "boundingVolume": {"region": region_deg(-1.0, -1.0, 2.0, 2.0)},
+                "content": {"batchSize": 1, "url": "0/0/0.b3dm"},
+                "children": [{
+                    "boundingVolume": {"region": region_deg(0.2, 0.2, 0.8, 0.8)},
+                    "content": {"batchSize": 1, "url": "1/1/0.b3dm"},
+                    "children": []
+                }]
+            }
+        });
+        let mut keep = Vec::new();
+        filter_tileset(tileset, "tileset.json", &unit_polygon(), &mut keep);
+        assert!(keep.contains(&"0/0/0.b3dm".to_string()));
+        assert!(keep.contains(&"1/1/0.b3dm".to_string()));
+    }
+
+    #[test]
+    fn filter_tileset_root_kept_even_without_intersection_test() {
+        // The root is never dropped: clipping only prunes below it.
+        let tileset = json!({
+            "root": {
+                "boundingVolume": {"region": region_deg(50.0, 50.0, 51.0, 51.0)},
+                "content": {"uri": "root.b3dm"},
+                "children": []
+            }
+        });
+        let mut keep = Vec::new();
+        let out = filter_tileset(tileset, "tileset.json", &unit_polygon(), &mut keep);
+        assert!(out["root"]["content"]["uri"].is_string());
+        assert!(keep.contains(&"root.b3dm".to_string()));
+    }
+
+    // --- filter_i3s_scenelayer ---
+
+    fn node(id: &str, lon: f64, lat: f64, radius_m: f64, children: &[&str]) -> I3SNode {
+        I3SNode {
+            id: id.to_string(),
+            doc_filename: format!("nodes/{id}/3dNodeIndexDocument.json"),
+            containing_doc: format!("nodepages/{}.json", id.parse::<u64>().map(|n| n / 64).unwrap_or(0)),
+            mbs: [lon, lat, 0.0, radius_m],
+            children: children.iter().map(|c| ChildRef { id: c.to_string() }).collect(),
+        }
+    }
+
+    #[test]
+    fn i3s_traversal_keeps_intersecting_and_descends_through_missed_parents() {
+        let mut all_nodes = HashMap::new();
+        // Root far outside the polygon, but its child sits inside: traversal must not
+        // spatially cull the child just because the parent missed.
+        all_nodes.insert("0".to_string(), node("0", 50.0, 50.0, 10.0, &["1", "2"]));
+        all_nodes.insert("1".to_string(), node("1", 0.5, 0.5, 100.0, &[]));
+        all_nodes.insert("2".to_string(), node("2", 30.0, 30.0, 10.0, &[]));
+
+        let scenelayer = json!({"store": {"rootNode": "./nodes/root"}});
+        let mut keep_uris = HashSet::new();
+        let mut kept_ids = HashSet::new();
+        filter_i3s_scenelayer(&scenelayer, &all_nodes, &unit_polygon(), &mut keep_uris, &mut kept_ids);
+
+        assert!(kept_ids.contains("1"), "in-polygon child of an out-of-polygon parent must be kept");
+        assert!(!kept_ids.contains("2"));
+        assert!(keep_uris.contains("nodes/1/3dNodeIndexDocument.json"));
+    }
+
+    #[test]
+    fn i3s_prefers_node_page_root_zero() {
+        let mut all_nodes = HashMap::new();
+        all_nodes.insert("0".to_string(), node("0", 0.5, 0.5, 50.0, &[]));
+        // A legacy "root" node also exists; "0" must win for 1.7+ node-page layouts.
+        all_nodes.insert("root".to_string(), node("0", 0.5, 0.5, 50.0, &[]));
+        let scenelayer = json!({"store": {"rootNode": "./nodes/root"}});
+        let mut keep_uris = HashSet::new();
+        let mut kept_ids = HashSet::new();
+        filter_i3s_scenelayer(&scenelayer, &all_nodes, &unit_polygon(), &mut keep_uris, &mut kept_ids);
+        assert!(kept_ids.contains("0"));
+    }
+
+    // --- expand_i3s_keep_set ---
+
+    #[test]
+    fn expand_keeps_resources_of_kept_nodes_only() {
+        let kept: HashSet<String> = ["1".to_string()].into_iter().collect();
+        let names = [
+            "nodes/1/3dNodeIndexDocument.json",
+            "nodes/1/geometries/0.bin",
+            "nodes/1/textures/0_0.jpg",
+            "nodes/1/shared/sharedResource.json",
+            "nodes/2/geometries/0.bin",
+            "nodepages/0.json",
+            "statistics/summary.json",
+            "metadata.json",
+            "3dSceneLayer.json",
+        ];
+        let mut keep_uris = HashSet::new();
+        let added = expand_i3s_keep_set(names.iter().copied(), &kept, &mut keep_uris);
+
+        assert!(keep_uris.contains("nodes/1/geometries/0.bin"));
+        assert!(keep_uris.contains("nodes/1/textures/0_0.jpg"));
+        assert!(keep_uris.contains("nodes/1/shared/sharedResource.json"));
+        assert!(!keep_uris.contains("nodes/2/geometries/0.bin"), "resources of dropped nodes must not be kept");
+        assert!(keep_uris.contains("nodepages/0.json"), "node pages are always kept");
+        assert!(keep_uris.contains("statistics/summary.json"));
+        assert!(keep_uris.contains("metadata.json"));
+        assert!(!keep_uris.contains("3dSceneLayer.json"), "scene layer is kept by the caller, not the expansion");
+        assert_eq!(added, keep_uris.len());
+    }
+
+    #[test]
+    fn expand_handles_nested_layer_prefixes() {
+        let kept: HashSet<String> = ["7".to_string()].into_iter().collect();
+        let names = [
+            "layers/0/nodes/7/geometries/0.bin",
+            "layers/0/nodes/8/geometries/0.bin",
+            "layers/0/nodepages/0.json",
+        ];
+        let mut keep_uris = HashSet::new();
+        expand_i3s_keep_set(names.iter().copied(), &kept, &mut keep_uris);
+        assert!(keep_uris.contains("layers/0/nodes/7/geometries/0.bin"));
+        assert!(!keep_uris.contains("layers/0/nodes/8/geometries/0.bin"));
+        assert!(keep_uris.contains("layers/0/nodepages/0.json"));
+    }
 }

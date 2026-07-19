@@ -53,6 +53,16 @@ jobs:
         with:
           targets: ${{ matrix.rustup_target }}
 
+      # aws-lc-rs (the AWS SDK's TLS crypto provider) compiles C sources and needs
+      # cmake + a C compiler on every platform, plus NASM on Windows MSVC.
+      - name: Install aws-lc-rs build prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+
+      - name: Install NASM for aws-lc-rs (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
       - name: Install musl-tools
         if: contains(matrix.build_target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools

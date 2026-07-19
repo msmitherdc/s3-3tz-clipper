@@ -50,6 +50,17 @@ cat <<EOF > montreal_clip.geojson
 }
 EOF
 
+# Assert the zip listing of $1 contains a path matching regex $2 ($3 = human label).
+assert_zip_contains() {
+    local archive="$1" pattern="$2" label="$3"
+    if ! unzip -l "$archive" | grep -Eq "$pattern"; then
+        echo "❌ ERROR: $archive is missing $label (no entry matching '$pattern')"
+        unzip -l "$archive" | head -n 40
+        exit 1
+    fi
+    echo "✔ $archive contains $label"
+}
+
 echo "==========================================="
 echo "2. Locating CI-Compiled Binary"
 echo "==========================================="
@@ -86,6 +97,12 @@ fi
 
 unzip -l clipped-jacksonville.3tz | head -n 25
 
+# A usable clipped .3tz must have the root tileset, the offset index, and actual
+# tile content payloads - not just JSON metadata.
+assert_zip_contains clipped-jacksonville.3tz 'tileset\.json(\.gz)?$' "root tileset.json"
+assert_zip_contains clipped-jacksonville.3tz '@3dtilesIndex1@' "the @3dtilesIndex1@ offset index"
+assert_zip_contains clipped-jacksonville.3tz '\.(b3dm|glb|i3dm|pnts|cmpt)(\.gz)?$' "tile content payloads"
+
 echo "==========================================="
 echo "✅ SUCCESS: Clipped, decompressed, and indexed s3://$BUCKET/$CES_TILES_KEY!"
 echo "==========================================="
@@ -112,6 +129,15 @@ if [ ! -f "clipped-montreal.spk" ]; then
 fi
 
 unzip -l clipped-montreal.spk | head -n 25
+
+# A usable clipped SLPK must have the scene layer, the offset index, node documents,
+# and - critically - the per-node payloads (geometries/textures/...). A regression
+# once shipped output with only node metadata and zero renderable content; the
+# geometries assertion is what catches that class of bug.
+assert_zip_contains clipped-montreal.spk '3dSceneLayer\.json(\.gz)?$' "3dSceneLayer.json"
+assert_zip_contains clipped-montreal.spk '@specialIndexFileHASH128@' "the @specialIndexFileHASH128@ offset index"
+assert_zip_contains clipped-montreal.spk 'nodes/[^/]+/' "per-node entries"
+assert_zip_contains clipped-montreal.spk 'geometries/' "node geometry payloads"
 
 echo "==========================================="
 echo "✅ SUCCESS: Clipped, decompressed, and indexed s3://$BUCKET/$I3S_KEY!"
