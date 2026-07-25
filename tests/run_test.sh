@@ -142,3 +142,166 @@ assert_zip_contains clipped-montreal.spk 'geometries/' "node geometry payloads"
 echo "==========================================="
 echo "✅ SUCCESS: Clipped, decompressed, and indexed s3://$BUCKET/$I3S_KEY!"
 echo "==========================================="
+
+echo "==========================================="
+echo "5. Clipping the same 3DTiles dataset from a LOCAL path (no --bucket)"
+echo "==========================================="
+# Stage the fixture on disk, then clip it with --bucket omitted. The local path must produce
+# the same set of entries as the S3 run above - it is the same pipeline with positional reads
+# swapped in for HTTP range requests.
+curl -sS -o "local-jacksonville.3tz" \
+  "https://$BUCKET.s3.amazonaws.com/$CES_TILES_KEY"
+
+$BINARY \
+  --key "local-jacksonville.3tz" \
+  --geojson "jacksonville_clip.geojson" \
+  --output "clipped-jacksonville-local.3tz" \
+  --progress \
+  --concurrency 10
+
+if [ ! -f "clipped-jacksonville-local.3tz" ]; then
+    echo "❌ ERROR: Output file clipped-jacksonville-local.3tz was not created!"
+    exit 1
+fi
+
+assert_zip_contains clipped-jacksonville-local.3tz 'tileset\.json(\.gz)?$' "root tileset.json"
+assert_zip_contains clipped-jacksonville-local.3tz '@3dtilesIndex1@' "the @3dtilesIndex1@ offset index"
+assert_zip_contains clipped-jacksonville-local.3tz '\.(b3dm|glb|i3dm|pnts|cmpt)(\.gz)?$' "tile content payloads"
+
+# The local and S3 runs must agree on entry names (byte order within the archive can differ,
+# since entries are written in fetch-completion order).
+if ! diff <(unzip -l clipped-jacksonville.3tz | awk '{print $4}' | sort) \
+          <(unzip -l clipped-jacksonville-local.3tz | awk '{print $4}' | sort) > /dev/null; then
+    echo "❌ ERROR: local-path output does not contain the same entries as the S3 output"
+    exit 1
+fi
+echo "✔ local-path output matches the S3 output entry-for-entry"
+
+echo "==========================================="
+echo "✅ SUCCESS: Clipped and indexed a local .3tz with no bucket!"
+echo "==========================================="
+
+echo "==========================================="
+echo "6. I3S 1.6 traversal must descend through non-intersecting ancestors"
+echo "==========================================="
+# The I3S LOD tree is NOT a strict spatial containment hierarchy: a parent's MBS does not
+# always bound its children's. This fixture puts the root and an intermediate node far outside
+# the clip polygon with a leaf *inside* it - culling the subtree at the first non-intersecting
+# node yields an archive with zero renderable content.
+python3 - <<'PYEOF'
+import zipfile, json
+def doc(nid, lon, lat, r, kids):
+    return json.dumps({"id": nid, "level": 0, "mbs": [lon, lat, 0.0, r],
+                       "children": [{"id": k, "href": f"../{k}"} for k in kids]})
+with zipfile.ZipFile("i3s16_fixture.slpk", "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("3dSceneLayer.json", json.dumps({
+        "id": 0, "version": "1.6", "name": "synthetic",
+        "store": {"id": "s", "profile": "meshpyramids", "rootNode": "./nodes/root", "version": "1.6"}}))
+    z.writestr("nodes/root/3dNodeIndexDocument.json", doc("root", 50.0, 50.0, 10.0, ["mid"]))
+    z.writestr("nodes/mid/3dNodeIndexDocument.json",  doc("mid",  40.0, 40.0, 10.0, ["leaf"]))
+    z.writestr("nodes/leaf/3dNodeIndexDocument.json", doc("leaf",  0.5,  0.5, 50.0, []))
+    z.writestr("nodes/leaf/geometries/0.bin", b"LEAF-GEOMETRY-PAYLOAD" * 50)
+    z.writestr("nodes/leaf/textures/0_0.jpg", b"LEAF-TEXTURE-PAYLOAD" * 50)
+json.dump({"type": "Feature", "properties": {}, "geometry": {"type": "Polygon",
+    "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]}}, open("unit_clip.geojson", "w"))
+PYEOF
+
+$BINARY \
+  --key "i3s16_fixture.slpk" \
+  --geojson "unit_clip.geojson" \
+  --output "clipped-i3s16.spk"
+
+assert_zip_contains clipped-i3s16.spk 'nodes/leaf/3dNodeIndexDocument\.json' "the in-polygon leaf node reached through two out-of-polygon ancestors"
+assert_zip_contains clipped-i3s16.spk 'nodes/leaf/geometries/0\.bin' "the leaf's geometry payload"
+assert_zip_contains clipped-i3s16.spk 'nodes/leaf/textures/0_0\.jpg' "the leaf's texture payload"
+
+# The out-of-polygon ancestors themselves must still be dropped - descending is not keeping.
+if unzip -l clipped-i3s16.spk | grep -Eq 'nodes/(root|mid)/'; then
+    echo "❌ ERROR: non-intersecting ancestor nodes were kept, not just traversed"
+    unzip -l clipped-i3s16.spk
+    exit 1
+fi
+echo "✔ non-intersecting ancestors were traversed but not kept"
+
+echo "==========================================="
+echo "✅ SUCCESS: I3S 1.6 traversal descends without over-keeping!"
+echo "==========================================="
+
+echo "==========================================="
+echo "7. ZIP64: a single entry larger than 4 GiB"
+echo "==========================================="
+# Opt-in: this holds the whole decompressed entry in memory (~4.5 GiB RSS). Everything else in
+# this script runs in a few hundred MB, so it is off by default.
+#
+# The `zip` crate does NOT upgrade an entry to ZIP64 automatically - writing past
+# ZIP64_BYTES_THR (u32::MAX) with `large_file` unset aborts with "Large file option has not
+# been set". The payload is all zeros, so a 4 GiB entry costs ~19 MB of fixture on disk and
+# ~130 KB of output, but still crosses the threshold (which keys off the *uncompressed* size).
+if [ "${RUN_ZIP64_TEST:-0}" != "1" ]; then
+    echo "⏭  SKIPPED (set RUN_ZIP64_TEST=1 to run; needs ~4.5 GiB RAM)"
+else
+    python3 - <<'PYEOF'
+import zipfile, json, math
+r = lambda d: d * math.pi / 180
+TARGET = 4 * 1024**3 + 8 * 1024**2      # strictly over u32::MAX
+CHUNK  = b"\0" * (8 * 1024 * 1024)
+with zipfile.ZipFile("zip64_fixture.3tz", "w", zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as z:
+    z.writestr("tileset.json", json.dumps({"asset": {"version": "1.0"}, "root": {
+        "boundingVolume": {"region": [r(0), r(0), r(1), r(1), 0, 10]},
+        "geometricError": 1, "refine": "ADD",
+        "children": [{"boundingVolume": {"region": [r(.2), r(.2), r(.8), r(.8), 0, 10]},
+                      "geometricError": 0, "content": {"uri": "huge.b3dm"}}]}}))
+    # force_zip64: the source entry's uncompressed size is itself over 4 GiB, so this also
+    # exercises ZIP64 extra-field parsing on the *read* side.
+    with z.open("huge.b3dm", "w", force_zip64=True) as fh:
+        written = 0
+        while written < TARGET:
+            n = min(len(CHUNK), TARGET - written)
+            fh.write(CHUNK[:n]); written += n
+json.dump({"type": "Feature", "properties": {}, "geometry": {"type": "Polygon",
+    "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]]}}, open("unit_clip.geojson", "w"))
+PYEOF
+
+    $BINARY \
+      --key "zip64_fixture.3tz" \
+      --geojson "unit_clip.geojson" \
+      --output "clipped-zip64.3tz" \
+      --max-entry-size 5120 \
+      --concurrency 2
+
+    python3 - <<'PYEOF'
+import zipfile, struct, sys, zlib
+EXPECT = 4 * 1024**3 + 8 * 1024**2
+z = zipfile.ZipFile("clipped-zip64.3tz")
+h = z.getinfo("huge.b3dm")
+if h.file_size != EXPECT:
+    sys.exit(f"❌ ERROR: entry is {h.file_size} bytes, expected {EXPECT}")
+# The Local File Header must carry a ZIP64 extra field (tag 0x0001).
+with open("clipped-zip64.3tz", "rb") as f:
+    f.seek(h.header_offset); lfh = f.read(30)
+    nlen, elen = struct.unpack_from("<HH", lfh, 26)
+    f.seek(h.header_offset + 30 + nlen); extra = f.read(elen)
+tags, o = [], 0
+while o + 4 <= len(extra):
+    t, sz = struct.unpack_from("<HH", extra, o); tags.append(t); o += 4 + sz
+if 0x0001 not in tags:
+    sys.exit(f"❌ ERROR: no ZIP64 extra field in the local file header (tags={tags})")
+# Stream the payload back: right length, right content, CRC agrees with the directory.
+n, crc, bad = 0, 0, 0
+with z.open("huge.b3dm") as fh:
+    while True:
+        b = fh.read(16 * 1024 * 1024)
+        if not b: break
+        n += len(b); crc = zlib.crc32(b, crc)
+        if b.count(0) != len(b): bad += 1
+if n != EXPECT or bad or crc != h.CRC:
+    sys.exit(f"❌ ERROR: payload readback failed (len={n} bad_chunks={bad} crc_ok={crc == h.CRC})")
+print(f"✔ {EXPECT:,}-byte entry round-tripped with ZIP64 headers and a matching CRC")
+PYEOF
+
+    assert_zip_contains clipped-zip64.3tz '@3dtilesIndex1@' "the @3dtilesIndex1@ offset index"
+    rm -f zip64_fixture.3tz clipped-zip64.3tz
+    echo "==========================================="
+    echo "✅ SUCCESS: >4 GiB entry written with per-entry ZIP64!"
+    echo "==========================================="
+fi
