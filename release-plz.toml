@@ -1,7 +1,11 @@
 [workspace]
-# This is a binary, not a library: nothing is published to crates.io (see `publish = false`
-# in Cargo.toml). Version detection therefore comes from git tags matching `git_tag_name`
-# below rather than from the registry.
+# This is a binary, not a library: nothing goes to crates.io. `git_only` both skips
+# `cargo publish` and switches version detection to git tags matching `git_tag_name` below,
+# instead of querying the registry.
+#
+# Note this must NOT be expressed as `publish = false` in Cargo.toml: release-plz excludes
+# such packages entirely, so it would report "nothing to release" and never tag anything.
+git_only = true
 git_release_enable = true
 git_tag_enable = true
 # Tag history is mixed: `1.0` through `1.0.8` are bare, but the most recent release is
