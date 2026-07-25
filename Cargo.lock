@@ -2184,7 +2184,7 @@ dependencies = [
 
 [[package]]
 name = "s3-3tz-clipper"
-version = "1.0.10"
+version = "1.0.11"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
