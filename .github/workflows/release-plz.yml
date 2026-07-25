@@ -1,0 +1,79 @@
+name: Release-plz
+
+# release-plz owns the version number: Cargo.toml is the source of truth, and the git tag
+# plus GitHub release are derived from it. Flow:
+#   1. `release-pr` opens/updates a "chore: release" PR that bumps Cargo.toml + Cargo.lock
+#      and writes CHANGELOG.md from the commits since the last tag.
+#   2. Merging that PR triggers `release`, which tags the merge commit and publishes the
+#      GitHub release.
+#   3. `build-binaries` then compiles and attaches the platform archives to that release.
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  release-plz-release:
+    name: Release-plz release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+      releases: ${{ steps.release-plz.outputs.releases }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Chained off the job above rather than `on: release: [published]`, because releases created
+  # with the default GITHUB_TOKEN deliberately do not trigger further workflow runs. Consuming
+  # the action's output keeps the build automatic without needing a PAT or GitHub App token.
+  build-binaries:
+    name: Build release binaries
+    needs: release-plz-release
+    if: needs.release-plz-release.outputs.releases_created == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ fromJSON(needs.release-plz-release.outputs.releases)[0].tag }}
+
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

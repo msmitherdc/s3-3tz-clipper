@@ -1,0 +1,11 @@
+[workspace]
+# This is a binary, not a library: nothing is published to crates.io (see `publish = false`
+# in Cargo.toml). Version detection therefore comes from git tags matching `git_tag_name`
+# below rather than from the registry.
+git_release_enable = true
+git_tag_enable = true
+# Tag history is mixed: `1.0` through `1.0.8` are bare, but the most recent release is
+# `v1.0.9`. Follow the newest convention (also release-plz's default) so version detection
+# sees v1.0.9 as the latest release and continues from there. A bare pattern would ignore
+# v1.0.9 and cut a duplicate 1.0.9.
+git_tag_name = "v{{ version }}"

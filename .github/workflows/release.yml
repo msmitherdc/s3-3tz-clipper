@@ -1,13 +1,21 @@
 name: Publish Rust Release Binaries
 
 on:
-  release:
-    types: [published] # Triggers when you create and publish a release on GitHub
+  # Called by release-plz.yml once it has tagged and published a release. It is *not* triggered
+  # by `release: [published]`: release-plz creates that release with the default GITHUB_TOKEN,
+  # and GitHub suppresses workflow runs for events raised by that token.
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to compile and upload binaries for'
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
-      tag_name:
-        description: 'Target release tag to compile and upload binaries'
+      tag:
+        description: 'Release tag to compile and upload binaries for'
         required: true
+        type: string
 permissions:
   contents: write # Required to upload assets to the release page
 
@@ -45,8 +53,12 @@ jobs:
             asset_name: s3-3tz-clipper-windows-amd64.zip
 
     steps:
+      # Build from the tagged commit, so the version compiled into the binary
+      # (CARGO_PKG_VERSION, reported by `--version`) is the released version.
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -101,8 +113,7 @@ jobs:
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2
         with:
-          # Use automated release tag, OR fallback to the manual workflow_dispatch input
-          tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag_name }} 
+          tag_name: ${{ inputs.tag }}
           files: ${{ matrix.asset_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

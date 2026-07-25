@@ -1,7 +1,10 @@
 [package]
 name = "s3-3tz-clipper"
-version = "1.0.8"
+version = "1.0.9"
 edition = "2021"
+# Distributed as prebuilt binaries attached to GitHub releases, never to crates.io.
+# release-plz reads this and derives the version history from git tags instead.
+publish = false
 
 [dependencies]
 tokio = { version = "1", features = ["full", "fs"] }
