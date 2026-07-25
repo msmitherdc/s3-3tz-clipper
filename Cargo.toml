@@ -5,7 +5,6 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full", "fs"] }
-tokio-util = { version = "0.7", features = ["compat"] }
 clap = { version = "4.4", features = ["derive"] }
 # `default-https-client` is the modern SDK TLS stack (hyper 1.x + rustls 0.23/aws-lc);
 # the legacy `rustls` feature pinned the deprecated hyper 0.14 + rustls 0.21 +
@@ -13,8 +12,19 @@ clap = { version = "4.4", features = ["derive"] }
 # HTTP stack alongside reqwest's.
 aws-config = { version = "1.1.7", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-s3 = { version = "1.135.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-async_zip = { version = "0.0.18", features = ["tokio", "deflate", "zstd"] }
+# `rustls-tls-webpki-roots-no-provider` rather than `rustls-tls`: both bundle the same webpki
+# root store, but plain `rustls-tls` also force-enables rustls' *ring* crypto provider. The
+# aws-sdk-s3 stack below already enables rustls' `aws-lc-rs` provider, and Cargo unifies those
+# features onto one rustls - so `rustls-tls` links two complete crypto backends into the
+# binary. Deferring the provider choice lets reqwest share the SDK's aws-lc-rs.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
+# Direct dependency purely to install the process-wide crypto provider that the
+# `-no-provider` reqwest feature above deliberately leaves unset (see main()). This must stay
+# on the same major version rustls that reqwest and aws-smithy-http-client resolve to - if
+# they ever move to a new major and this doesn't, the provider gets installed on the *wrong*
+# rustls and the unsigned path panics with "No provider set". `tests/run_test.sh` exercises
+# `--no-sign-request` against real S3, which is what catches that.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 geojson = "1.0"
 geo = "0.33"
 serde_json = "1.0"
@@ -23,7 +33,19 @@ indicatif = "0.18"
 s2 = "0.1"
 md5 = "0.8"
 crc32fast = "1.3"
-flate2 = "1.0"
-zip = "8.6.0"
+# `zlib-rs` is the high-performance zlib-ng port; without it flate2 falls back to the slower
+# miniz_oxide backend. This was previously enabled only as a side effect of the `zip` crate's
+# default features - declared explicitly here so trimming those (below) can't silently
+# downgrade every deflate/gzip decode in the hot path.
+flate2 = { version = "1.0", features = ["zlib-rs"] }
+# The single zip implementation: writes the clipped archive (on the blocking pool) and re-reads
+# it to patch the index entry's CRC/payload in place. This replaced a second, async zip stack
+# (`async_zip` + `async-compression`) that duplicated the same codecs; `zip` is the maintained,
+# 1.0+ crate, whereas async_zip is still pre-1.0.
+#
+# `default-features = false` drops bzip2, lzma, xz, ppmd, deflate64, zopfli and aes-crypto -
+# codecs this tool never reads or writes. `zstd` is required: it is the method the output's own
+# entries use (per the 3tz spec). `deflate-flate2-zlib-rs` covers reading DEFLATE sources.
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd"] }
 zstd = "0.13"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

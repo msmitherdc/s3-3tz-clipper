@@ -3,33 +3,56 @@ mod clip;
 use aws_config::BehaviorVersion;
 use clap::Parser;
 use std::fs::File as StdFile;
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use async_zip::tokio::write::ZipFileWriter;
-use async_zip::{Compression, ZipEntryBuilder};
-use tokio::fs::File as AsyncFile;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
-use tokio_util::compat::TokioAsyncWriteCompatExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::sync::{mpsc, Semaphore};
 use flate2::read::{DeflateDecoder, GzDecoder};
 use flate2::write::GzEncoder;
 use flate2::Compression as GzCompression;
-use zip::ZipArchive;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 use tracing_subscriber::EnvFilter;
 use futures::stream::{FuturesUnordered, StreamExt};
 use geo::{Intersects, BoundingRect};
 use std::path::Path;
 use crate::clip::{I3SNode, ChildRef};
 
-/// Maximum decompressed size per entry (64 MiB) — prevents zip bomb attacks.
-const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+/// Default maximum decompressed size per entry, in MiB - a zip-bomb guard, not a format
+/// limit. Entries above it are skipped with an error rather than silently truncated, so the
+/// cap has to clear the largest *legitimate* tile payload or clipping quietly loses content.
+/// Override with `--max-entry-size`.
+const DEFAULT_MAX_ENTRY_MIB: u64 = 256;
+
+/// Peak in-memory decompressed bytes (`--max-entry-size` * `--concurrency`) past which we warn
+/// that the configured ceiling could exhaust memory if every in-flight entry were maximal.
+const MEMORY_CEILING_WARN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Knobs threaded through the clipping pipeline. Grouped so the per-archive entry points stay
+/// readable as options accumulate.
+#[derive(Debug, Clone, Copy)]
+struct ClipOptions {
+    /// Max concurrent downloads within a single archive's tile fetches.
+    concurrency: usize,
+    /// Max archives clipped in parallel in `--package` mode.
+    archive_concurrency: usize,
+    progress: bool,
+    debug: bool,
+    /// Maximum decompressed size accepted for any single entry.
+    max_entry_bytes: u64,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Cloud-Optimized 3dtiles/I3S Clipper")]
 struct Args {
-    #[arg(short, long)] bucket: String,
+    /// Raw name of the S3 bucket (do not prefix with `s3://`). Omit to read from the local
+    /// filesystem instead, in which case `--key`/`--package` are interpreted as paths
+    /// (relative to `--root` if given, otherwise to the current directory).
+    #[arg(short, long)] bucket: Option<String>,
+    /// Base directory for local-filesystem reads. Only meaningful when `--bucket` is
+    /// omitted; `--key`/`--package` are resolved relative to it.
+    #[arg(long, conflicts_with = "bucket")] root: Option<String>,
     /// Full path to a single `.3tz`/`.slpk`/`.spk` archive within the bucket. Mutually
     /// exclusive with `--package`.
     #[arg(short, long, conflicts_with = "package", required_unless_present = "package")] key: Option<String>,
@@ -54,6 +77,11 @@ struct Args {
     #[arg(long, default_value_t = 4)] archive_concurrency: usize,
     #[arg(long, default_value_t = false)] debug: bool,
     #[arg(long, default_value_t = false)] no_sign_request: bool,
+    /// Maximum decompressed size accepted for a single archive entry, in MiB. Entries larger
+    /// than this are skipped with an error, so raise it if a dataset has legitimately huge
+    /// tiles. Guards against zip bombs; peak memory scales with this * `--concurrency`.
+    #[arg(long, default_value_t = DEFAULT_MAX_ENTRY_MIB, value_parser = clap::value_parser!(u64).range(1..))]
+    max_entry_size: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,20 +100,68 @@ struct CdEntry {
     comp_method: u16,
 }
 
+/// Where archives are read from. `bucket` is ignored by the `Local` variant, which resolves
+/// `key` against its own root directory instead.
 #[derive(Clone)]
-enum S3Client {
+enum ObjectSource {
     Signed(aws_sdk_s3::Client),
     Unsigned(reqwest::Client, String),
+    Local(std::path::PathBuf),
 }
 
-impl S3Client {
+/// Read `len` bytes at `offset` from a local file without disturbing any shared cursor, so
+/// concurrent range reads of the same archive don't need to serialize behind a seek. Runs on
+/// the blocking pool: this is a real syscall that would otherwise stall a runtime worker.
+async fn local_read_at(path: std::path::PathBuf, offset: u64, len: usize) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    tokio::task::spawn_blocking(move || {
+        let file = StdFile::open(&path).map_err(|e| format!("Could not open '{}': {}", path.display(), e))?;
+        let mut buf = vec![0u8; len];
+        let mut filled = 0usize;
+        while filled < len {
+            let n = {
+                #[cfg(unix)]
+                { std::os::unix::fs::FileExt::read_at(&file, &mut buf[filled..], offset + filled as u64)? }
+                #[cfg(windows)]
+                { std::os::windows::fs::FileExt::seek_read(&file, &mut buf[filled..], offset + filled as u64)? }
+            };
+            // A short read at EOF is expected when a caller's speculative range runs past the
+            // end of the file; truncate rather than erroring so the caller sees what exists.
+            if n == 0 { break; }
+            filled += n;
+        }
+        buf.truncate(filled);
+        Ok(buf)
+    })
+    .await?
+}
+
+impl ObjectSource {
+    /// Resolve a key to a local path. Used only by the `Local` variant.
+    fn local_path(root: &std::path::Path, key: &str) -> std::path::PathBuf {
+        root.join(key)
+    }
+
+    /// Human-readable location of `key`, for log messages.
+    fn describe(&self, bucket: &str, key: &str) -> String {
+        match self {
+            ObjectSource::Local(root) => Self::local_path(root, key).display().to_string(),
+            _ => format!("s3://{}/{}", bucket, key),
+        }
+    }
+
     async fn fetch_size(&self, bucket: &str, key: &str) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         match self {
-            S3Client::Signed(client) => {
+            ObjectSource::Local(root) => {
+                let path = Self::local_path(root, key);
+                let meta = tokio::fs::metadata(&path).await
+                    .map_err(|e| format!("Could not stat '{}': {}", path.display(), e))?;
+                Ok(meta.len())
+            }
+            ObjectSource::Signed(client) => {
                 let head = client.head_object().bucket(bucket).key(key).send().await?;
                 Ok(head.content_length().unwrap_or(0) as u64)
             }
-            S3Client::Unsigned(client, base_url) => {
+            ObjectSource::Unsigned(client, base_url) => {
                 let url = format!("{}/{}/{}", base_url, bucket, key);
                 let resp = client.head(&url).send().await?;
                 if !resp.status().is_success() {
@@ -101,9 +177,16 @@ impl S3Client {
         }
     }
 
+    /// Fetch the inclusive byte range `[start, end]`. May return fewer bytes than requested
+    /// if the range runs past the end of the object; callers that speculatively over-fetch
+    /// rely on that.
     async fn fetch_range(&self, bucket: &str, key: &str, start: u64, end: u64) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         match self {
-            S3Client::Signed(client) => {
+            ObjectSource::Local(root) => {
+                let len = end.saturating_sub(start).saturating_add(1) as usize;
+                local_read_at(Self::local_path(root, key), start, len).await
+            }
+            ObjectSource::Signed(client) => {
                 let resp = client.get_object()
                     .bucket(bucket)
                     .key(key)
@@ -112,7 +195,7 @@ impl S3Client {
                     .await?;
                 Ok(resp.body.collect().await?.into_bytes().to_vec())
             }
-            S3Client::Unsigned(client, base_url) => {
+            ObjectSource::Unsigned(client, base_url) => {
                 let url = format!("{}/{}/{}", base_url, bucket, key);
                 let resp = client.get(&url)
                     .header(reqwest::header::RANGE, format!("bytes={}-{}", start, end))
@@ -131,11 +214,16 @@ impl S3Client {
     /// around.
     async fn fetch_object(&self, bucket: &str, key: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         match self {
-            S3Client::Signed(client) => {
+            ObjectSource::Local(root) => {
+                let path = Self::local_path(root, key);
+                tokio::fs::read(&path).await
+                    .map_err(|e| format!("Could not read '{}': {}", path.display(), e).into())
+            }
+            ObjectSource::Signed(client) => {
                 let resp = client.get_object().bucket(bucket).key(key).send().await?;
                 Ok(resp.body.collect().await?.into_bytes().to_vec())
             }
-            S3Client::Unsigned(client, base_url) => {
+            ObjectSource::Unsigned(client, base_url) => {
                 let url = format!("{}/{}/{}", base_url, bucket, key);
                 let resp = client.get(&url).send().await?;
                 if !resp.status().is_success() {
@@ -153,26 +241,29 @@ struct DownloadedFile {
 }
 
 /// Read a decompression stream to completion, erroring (rather than silently truncating)
-/// if it exceeds MAX_DECOMPRESSED_BYTES.
-fn read_capped(reader: &mut impl Read) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+/// if it exceeds `max_bytes`.
+fn read_capped(reader: &mut impl Read, max_bytes: u64) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = Vec::new();
-    reader.take(MAX_DECOMPRESSED_BYTES + 1).read_to_end(&mut buf)?;
-    if buf.len() as u64 > MAX_DECOMPRESSED_BYTES {
-        return Err(format!("Entry exceeds the {} MiB decompressed-size limit", MAX_DECOMPRESSED_BYTES / (1024 * 1024)).into());
+    reader.take(max_bytes + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(format!(
+            "Entry exceeds the {} MiB decompressed-size limit (raise --max-entry-size to keep it)",
+            max_bytes / (1024 * 1024)
+        ).into());
     }
     Ok(buf)
 }
 
-fn decompress_deflate(compressed: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    read_capped(&mut DeflateDecoder::new(compressed))
+fn decompress_deflate(compressed: &[u8], max_bytes: u64) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    read_capped(&mut DeflateDecoder::new(compressed), max_bytes)
 }
 
-fn decompress_gzip(compressed: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    read_capped(&mut GzDecoder::new(compressed))
+fn decompress_gzip(compressed: &[u8], max_bytes: u64) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    read_capped(&mut GzDecoder::new(compressed), max_bytes)
 }
 
-fn decompress_zstd(compressed: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    read_capped(&mut zstd::Decoder::new(compressed)?)
+fn decompress_zstd(compressed: &[u8], max_bytes: u64) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    read_capped(&mut zstd::Decoder::new(compressed)?, max_bytes)
 }
 
 fn parse_central_directory(cd_bytes: &[u8]) -> Vec<CdEntry> {
@@ -289,47 +380,139 @@ fn load_custom_certs() -> Result<Option<reqwest::Certificate>, Box<dyn std::erro
     Ok(Some(cert))
 }
 
-async fn fetch_file_content(
-    client: &S3Client,
+/// Extra-field slop speculatively appended to an entry's Local File Header read so the header
+/// and its payload arrive in a *single* range request instead of two.
+///
+/// A Local File Header's extra field is a per-entry length we can't know from the Central
+/// Directory, so the naive implementation reads 30 bytes, learns the length, then issues a
+/// second request for the payload - doubling the request count for the whole clip. ZIP64
+/// extras are 20-28 bytes and Unix timestamp/uid extras add a few dozen more, so 128 bytes
+/// covers every layout seen in practice; over-reading a little is vastly cheaper than a
+/// second round trip per entry. The exact-payload path below still handles the rare miss.
+const LFH_EXTRA_SLOP: u64 = 128;
+
+/// Fetch an entry's raw (still zip-compressed) payload bytes, skipping past its Local File
+/// Header.
+async fn fetch_raw_entry(
+    client: &ObjectSource,
     bucket: &str,
     key: &str,
     entry: &CdEntry,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let lfh_header = client.fetch_range(bucket, key, entry.header_offset, entry.header_offset + 29).await?;
-    if lfh_header.len() < 30 { return Err(format!("Short LFH header for '{}'", entry.filename).into()); }
-    let lfh_fname_len = u16::from_le_bytes(lfh_header[26..28].try_into().unwrap()) as u64;
-    let lfh_extra_len = u16::from_le_bytes(lfh_header[28..30].try_into().unwrap()) as u64;
-    let payload_start_offset = entry.header_offset + 30 + lfh_fname_len + lfh_extra_len;
+    // Directory markers and genuinely empty files have no payload at all. Fetching them would
+    // compute an inclusive end offset of `start - 1`, underflowing to u64::MAX.
+    if entry.compressed_size == 0 {
+        return Ok(Vec::new());
+    }
 
-    let raw_payload = client.fetch_range(bucket, key, payload_start_offset, payload_start_offset + entry.compressed_size - 1).await?;
+    let speculative_len = 30 + entry.filename.len() as u64 + LFH_EXTRA_SLOP + entry.compressed_size;
+    let buf = client
+        .fetch_range(bucket, key, entry.header_offset, entry.header_offset + speculative_len - 1)
+        .await?;
+    if buf.len() < 30 {
+        return Err(format!("Short LFH header for '{}'", entry.filename).into());
+    }
 
-    let file_data = match entry.comp_method {
-        8 => decompress_deflate(&raw_payload)?,
+    let lfh_fname_len = u16::from_le_bytes(buf[26..28].try_into().unwrap()) as u64;
+    let lfh_extra_len = u16::from_le_bytes(buf[28..30].try_into().unwrap()) as u64;
+    let payload_start = 30 + lfh_fname_len + lfh_extra_len;
+    let payload_end = payload_start
+        .checked_add(entry.compressed_size)
+        .ok_or_else(|| format!("Implausible payload extent for '{}'", entry.filename))?;
+
+    if payload_end <= buf.len() as u64 {
+        let mut data = buf;
+        data.truncate(payload_end as usize);
+        data.drain(..payload_start as usize);
+        return Ok(data);
+    }
+
+    // The header's extra field ran past our slop - fall back to fetching the payload exactly.
+    let abs_start = entry.header_offset + payload_start;
+    client
+        .fetch_range(bucket, key, abs_start, abs_start + entry.compressed_size - 1)
+        .await
+}
+
+/// Whether a payload of `len` bytes needs per-entry ZIP64 headers when written.
+///
+/// The `zip` crate does *not* upgrade an entry automatically: writing more than
+/// `spec::ZIP64_BYTES_THR` (== `u32::MAX`) uncompressed bytes with `large_file` unset aborts
+/// the entry with "Large file option has not been set". Setting it unconditionally would
+/// instead add ZIP64 extra fields to every header in the archive, so the choice is made per
+/// entry - which is only possible because entries are written from an in-memory buffer whose
+/// length is known up front.
+fn needs_zip64(len: usize) -> bool {
+    len as u64 > u32::MAX as u64
+}
+
+/// Undo an entry's zip compression layer, and - only if `gunzip` - its `.gz` content encoding
+/// on top of that. Callers that just want to copy a `.gz` entry through to the output verbatim
+/// pass `gunzip = false` and skip an entire decompress/recompress cycle.
+fn decode_entry(
+    raw: Vec<u8>,
+    comp_method: u16,
+    gunzip: bool,
+    max_bytes: u64,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let file_data = match comp_method {
+        8 => decompress_deflate(&raw, max_bytes)?,
         // Zstandard - what OWT/Vricon .3tz archives actually use for every entry.
-        93 => decompress_zstd(&raw_payload)?,
-        _ => raw_payload,
+        93 => decompress_zstd(&raw, max_bytes)?,
+        _ => raw,
     };
-
-    if entry.filename.ends_with(".gz") {
-        decompress_gzip(&file_data)
+    if gunzip {
+        decompress_gzip(&file_data, max_bytes)
     } else {
         Ok(file_data)
     }
 }
 
+async fn fetch_entry_decoded(
+    client: &ObjectSource,
+    bucket: &str,
+    key: &str,
+    entry: &CdEntry,
+    gunzip: bool,
+    max_bytes: u64,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let raw_payload = fetch_raw_entry(client, bucket, key, entry).await?;
+    let comp_method = entry.comp_method;
+
+    // Inflate on the blocking pool. Entries decompress to as much as `max_bytes`, and doing
+    // that inline parks a tokio worker for the whole decode - stalling the I/O completions of
+    // every other in-flight fetch that happens to share the thread. This is what makes the
+    // decompression actually parallel across cores.
+    tokio::task::spawn_blocking(move || decode_entry(raw_payload, comp_method, gunzip, max_bytes)).await?
+}
+
+/// Fetch an entry fully decoded - zip layer *and* any `.gz` content encoding removed - so the
+/// caller gets the plaintext bytes (JSON, tile payload, …).
+async fn fetch_file_content(
+    client: &ObjectSource,
+    bucket: &str,
+    key: &str,
+    entry: &CdEntry,
+    max_bytes: u64,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let gunzip = entry.filename.ends_with(".gz");
+    fetch_entry_decoded(client, bucket, key, entry, gunzip, max_bytes).await
+}
+
 async fn fetch_and_clip_3dtiles_json(
-    client: Arc<S3Client>,
+    client: Arc<ObjectSource>,
     bucket: String,
     key: String,
     archive_entries: Arc<Vec<CdEntry>>,
     entry_index: Arc<HashMap<String, usize>>,
     json_path: String,
     polygon: Arc<geo::Polygon<f64>>,
+    max_bytes: u64,
 ) -> Result<(String, serde_json::Value, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
     let entry = lookup_entry(&archive_entries, &entry_index, &json_path)
         .ok_or_else(|| format!("Missing JSON entry: {}", json_path))?;
 
-    let json_bytes = fetch_file_content(&client, &bucket, &key, entry).await?;
+    let json_bytes = fetch_file_content(&client, &bucket, &key, entry, max_bytes).await?;
     let json_val: serde_json::Value = serde_json::from_slice(&json_bytes)?;
 
     let mut local_uris = Vec::new();
@@ -343,15 +526,14 @@ async fn fetch_and_clip_3dtiles_json(
 /// single-archive pipeline, factored out so both plain `--key` mode and each archive
 /// discovered via `--package` mode share the exact same logic.
 async fn clip_one_archive(
-    s3_client: Arc<S3Client>,
+    s3_client: Arc<ObjectSource>,
     bucket: &str,
     key: &str,
     output_path: &Path,
     clip_polygon: Arc<geo::Polygon<f64>>,
-    concurrency: usize,
-    progress: bool,
-    debug: bool,
+    opts: ClipOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ClipOptions { concurrency, progress, debug, max_entry_bytes, .. } = opts;
     let archive_format = if key.ends_with(".3tz") {
         ArchiveFormat::Cesium3DTiles
     } else if key.ends_with(".slpk") || key.ends_with(".spk") {
@@ -366,7 +548,7 @@ async fn clip_one_archive(
         }
     }
 
-    println!("Connecting to s3://{}/{}...", bucket, key);
+    println!("Opening {}...", s3_client.describe(bucket, key));
     let file_size = s3_client.fetch_size(bucket, key).await?;
 
     let mut cd_offset = 0u64;
@@ -457,35 +639,55 @@ async fn clip_one_archive(
         queue.push_back("tileset.json".to_string());
 
         let mut visited = HashSet::new();
+        // Walk the external-tileset graph breadth-first with up to `concurrency` fetches in
+        // flight. The nested tilesets discovered at one level are independent of each other,
+        // so awaiting them one at a time (as this used to) serialized a round trip per
+        // external tileset - the dominant cost on datasets that fan out into many of them.
+        let mut active = FuturesUnordered::new();
+        let semaphore = Arc::new(Semaphore::new(concurrency));
 
-        while let Some(json_path) = queue.pop_front() {
-            if !visited.insert(json_path.clone()) { continue; }
+        while !queue.is_empty() || !active.is_empty() {
+            while let Some(json_path) = queue.pop_front() {
+                if !visited.insert(json_path.clone()) { continue; }
 
-            match fetch_and_clip_3dtiles_json(
-                s3_client.clone(),
-                bucket.to_string(),
-                key.to_string(),
-                archive_entries.clone(),
-                entry_index.clone(),
-                json_path.clone(),
-                clip_polygon.clone(),
-            ).await {
-                Ok((path, clipped_json, local_uris)) => {
+                let client = s3_client.clone();
+                let bucket = bucket.to_string();
+                let key = key.to_string();
+                let entries = archive_entries.clone();
+                let index = entry_index.clone();
+                let polygon = clip_polygon.clone();
+                let sem = semaphore.clone();
+
+                active.push(tokio::spawn(async move {
+                    let _permit = sem.acquire_owned().await.unwrap();
+                    let result = fetch_and_clip_3dtiles_json(
+                        client, bucket, key, entries, index, json_path.clone(), polygon, max_entry_bytes,
+                    ).await;
+                    (json_path, result)
+                }));
+
+                if active.len() >= concurrency { break; }
+            }
+
+            let Some(joined) = active.next().await else { continue };
+            match joined {
+                Err(join_err) => eprintln!("[ERROR] Tileset task failed: {}", join_err),
+                Ok((json_path, Err(e))) => {
+                    eprintln!("[ERROR] Failed to fetch and clip 3D Tiles JSON {}: {}", json_path, e);
+                }
+                Ok((_, Ok((path, clipped_json, local_uris)))) => {
                     processed_jsons.insert(path.clone(), clipped_json);
                     keep_uris.insert(path);
 
                     for uri in local_uris {
                         if uri.ends_with(".json") {
                             // Recursively fetch nested tilesets
-                            queue.push_back(uri.clone());
+                            queue.push_back(uri);
                         } else {
                             // Mark data files (e.g., .b3dm, .glb) to be kept
                             keep_uris.insert(uri);
                         }
                     }
-                },
-                Err(e) => {
-                    eprintln!("[ERROR] Failed to fetch and clip 3D Tiles JSON {}: {}", json_path, e);
                 }
             }
         }
@@ -497,7 +699,7 @@ async fn clip_one_archive(
         let root_entry = lookup_entry(&archive_entries, &entry_index, &root_json_path).ok_or("3dSceneLayer.json[.gz] not found")?;
 
         println!("Fetching 3dSceneLayer.json...");
-        let scenelayer_bytes = fetch_file_content(&s3_client, bucket, key, root_entry).await?;
+        let scenelayer_bytes = fetch_file_content(&s3_client, bucket, key, root_entry, max_entry_bytes).await?;
         let scenelayer_json: serde_json::Value = serde_json::from_slice(&scenelayer_bytes)?;
         keep_uris.insert(root_json_path.clone());
 
@@ -530,7 +732,7 @@ async fn clip_one_archive(
 
                 fetch_tasks.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.unwrap();
-                    let bytes_res = fetch_file_content(&client, &bucket, &key, &entry_clone).await;
+                    let bytes_res = fetch_file_content(&client, &bucket, &key, &entry_clone, max_entry_bytes).await;
                     (entry_clone, bytes_res)
                 }));
             }
@@ -565,62 +767,12 @@ async fn clip_one_archive(
                                     doc_filename.clone()
                                 };
 
-                                let mut mbs = [0.0f64; 4];
-                                let mut has_bounds = false;
-
-                                if let Some(mbs_arr) = node_val.get("mbs").and_then(|m| m.as_array()) {
-                                    if mbs_arr.len() >= 4 {
-                                        for i in 0..4 {
-                                            mbs[i] = mbs_arr[i].as_f64().unwrap_or(0.0);
-                                        }
-                                        has_bounds = true;
-                                    }
-                                } else if let Some(obb_obj) = node_val.get("obb").and_then(|o| o.as_object()) {
-                                    if let (Some(center), Some(half_size)) = (obb_obj.get("center").and_then(|c| c.as_array()), obb_obj.get("halfSize").and_then(|h| h.as_array())) {
-                                        if center.len() >= 3 && half_size.len() >= 3 {
-                                            mbs[0] = center[0].as_f64().unwrap_or(0.0);
-                                            mbs[1] = center[1].as_f64().unwrap_or(0.0);
-                                            mbs[2] = center[2].as_f64().unwrap_or(0.0);
-                                            let hx = half_size[0].as_f64().unwrap_or(0.0);
-                                            let hy = half_size[1].as_f64().unwrap_or(0.0);
-                                            let hz = half_size[2].as_f64().unwrap_or(0.0);
-                                            mbs[3] = (hx * hx + hy * hy + hz * hz).sqrt();
-                                            has_bounds = true;
-                                        }
-                                    }
-                                } else if let Some(obb_arr) = node_val.get("obb").and_then(|o| o.as_array()) {
-                                    if obb_arr.len() >= 6 {
-                                        mbs[0] = obb_arr[0].as_f64().unwrap_or(0.0);
-                                        mbs[1] = obb_arr[1].as_f64().unwrap_or(0.0);
-                                        mbs[2] = obb_arr[2].as_f64().unwrap_or(0.0);
-                                        let hx = obb_arr[3].as_f64().unwrap_or(0.0);
-                                        let hy = obb_arr[4].as_f64().unwrap_or(0.0);
-                                        let hz = obb_arr[5].as_f64().unwrap_or(0.0);
-                                        mbs[3] = (hx * hx + hy * hy + hz * hz).sqrt();
-                                        has_bounds = true;
-                                    }
-                                }
-
-                                if !has_bounds { continue; }
+                                let Some(mbs) = clip::parse_node_bounds(node_val) else { continue };
 
                                 let mut children = Vec::new();
                                 if let Some(children_arr) = node_val.get("children").and_then(|c| c.as_array()) {
                                     for child_val in children_arr {
-                                        let child_id = match child_val {
-                                            serde_json::Value::Number(n) => Some(n.to_string()),
-                                            serde_json::Value::String(s) => Some(s.clone()),
-                                            serde_json::Value::Object(o) => {
-                                                o.get("id").or_else(|| o.get("index")).and_then(|v| {
-                                                    match v {
-                                                        serde_json::Value::String(s) => Some(s.clone()),
-                                                        serde_json::Value::Number(n) => Some(n.to_string()),
-                                                        _ => None
-                                                    }
-                                                })
-                                            },
-                                            _ => None
-                                        };
-                                        if let Some(cid) = child_id {
+                                        if let Some(cid) = clip::child_id_of(child_val) {
                                             children.push(ChildRef { id: cid });
                                         }
                                     }
@@ -670,7 +822,10 @@ async fn clip_one_archive(
                 kept_node_ids.len()
             );
         } else {
-            println!("Detected I3S 1.6 / flat dataset. Traversing tree lazily (Parallel)...");
+            // Note this walks the *whole* node tree rather than pruning at the first
+            // non-intersecting node: see the traversal below for why spatial culling of
+            // subtrees is unsound for I3S. Correctness over round trips.
+            println!("Detected I3S 1.6 / flat dataset. Traversing full node tree (Parallel)...");
 
             let root_node_path_str = scenelayer_json
                 .get("store")
@@ -715,7 +870,7 @@ async fn clip_one_archive(
                             let res: Result<(String, String, Vec<u8>), String> = match entry {
                                 None => Err(format!("Node {} not found in archive", node_id)),
                                 Some(e) => {
-                                    match fetch_file_content(&client, &bucket, &key, e).await {
+                                    match fetch_file_content(&client, &bucket, &key, e, max_entry_bytes).await {
                                         Err(err) => Err(format!("Failed to fetch node {}: {}", node_id, err)),
                                         Ok(bytes) => Ok((node_id, e.filename.clone(), bytes))
                                     }
@@ -736,90 +891,41 @@ async fn clip_one_archive(
                             }
                         }
                         Ok(Ok((node_id, containing_doc, bytes))) => {
-                            if let Ok(node_val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                                let mut mbs = [0.0f64; 4];
-                                let mut has_bounds = false;
-                                if let Some(mbs_arr) = node_val.get("mbs").and_then(|m| m.as_array()) {
-                                    if mbs_arr.len() >= 4 {
-                                        for i in 0..4 {
-                                            mbs[i] = mbs_arr[i].as_f64().unwrap_or(0.0);
-                                        }
-                                        has_bounds = true;
-                                    }
-                                } else if let Some(obb_obj) = node_val.get("obb").and_then(|o| o.as_object()) {
-                                    if let (Some(center), Some(half_size)) = (obb_obj.get("center").and_then(|c| c.as_array()), obb_obj.get("halfSize").and_then(|h| h.as_array())) {
-                                        if center.len() >= 3 && half_size.len() >= 3 {
-                                            mbs[0] = center[0].as_f64().unwrap_or(0.0);
-                                            mbs[1] = center[1].as_f64().unwrap_or(0.0);
-                                            mbs[2] = center[2].as_f64().unwrap_or(0.0);
-                                            let hx = half_size[0].as_f64().unwrap_or(0.0);
-                                            let hy = half_size[1].as_f64().unwrap_or(0.0);
-                                            let hz = half_size[2].as_f64().unwrap_or(0.0);
-                                            mbs[3] = (hx * hx + hy * hy + hz * hz).sqrt();
-                                            has_bounds = true;
-                                        }
-                                    }
-                                } else if let Some(obb_arr) = node_val.get("obb").and_then(|o| o.as_array()) {
-                                    if obb_arr.len() >= 6 {
-                                        mbs[0] = obb_arr[0].as_f64().unwrap_or(0.0);
-                                        mbs[1] = obb_arr[1].as_f64().unwrap_or(0.0);
-                                        mbs[2] = obb_arr[2].as_f64().unwrap_or(0.0);
-                                        let hx = obb_arr[3].as_f64().unwrap_or(0.0);
-                                        let hy = obb_arr[4].as_f64().unwrap_or(0.0);
-                                        let hz = obb_arr[5].as_f64().unwrap_or(0.0);
-                                        mbs[3] = (hx * hx + hy * hy + hz * hz).sqrt();
-                                        has_bounds = true;
-                                    }
-                                }
+                            let Ok(node_val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                                eprintln!("[WARN] Failed to parse valid JSON from node '{}'.", node_id);
+                                continue;
+                            };
 
-                                if !has_bounds { continue; }
-
-                                // MBS degree coordinate conversion
-                                let mbs_center_x = mbs[0];
-                                let mbs_center_y = mbs[1];
-                                let mbs_radius_meters = mbs[3];
-
-                                let lat_rad = mbs_center_y.to_radians();
-                                let meters_per_deg_lat = 111320.0;
-                                let meters_per_deg_lon = (111320.0 * lat_rad.cos()).max(1.0);
-
-                                let radius_deg_x = mbs_radius_meters / meters_per_deg_lon;
-                                let radius_deg_y = mbs_radius_meters / meters_per_deg_lat;
-
-                                let node_bbox = geo::Rect::new(
-                                    geo::Coord { x: mbs_center_x - radius_deg_x, y: mbs_center_y - radius_deg_y },
-                                    geo::Coord { x: mbs_center_x + radius_deg_x, y: mbs_center_y + radius_deg_y },
-                                );
-
-                                let intersects = polygon_bbox.intersects(&node_bbox) && clip_polygon.intersects(&node_bbox);
-
-                                if intersects {
-                                    keep_uris.insert(containing_doc);
-                                    keep_uris.insert(format!("nodes/{}/3dNodeIndexDocument.json", node_id));
-                                    kept_node_ids.insert(node_id.clone());
-
-                                    if let Some(children_arr) = node_val.get("children").and_then(|c| c.as_array()) {
-                                        for child_val in children_arr {
-                                            let child_id = match child_val {
-                                                serde_json::Value::Number(n) => Some(n.to_string()),
-                                                serde_json::Value::String(s) => Some(s.clone()),
-                                                serde_json::Value::Object(o) => {
-                                                    o.get("id").or_else(|| o.get("index")).and_then(|v| {
-                                                        match v {
-                                                            serde_json::Value::String(s) => Some(s.clone()),
-                                                            serde_json::Value::Number(n) => Some(n.to_string()),
-                                                            _ => None
-                                                        }
-                                                    })
-                                                },
-                                                _ => None
-                                            };
-                                            if let Some(cid) = child_id {
-                                                queue.push_back(cid);
-                                            }
+                            // Always enqueue this node's children, whether or not it
+                            // intersects - and whether or not it even declares usable bounds.
+                            // The I3S LOD tree is NOT a strict spatial containment hierarchy:
+                            // a parent's MBS does not always bound its children's, so pruning
+                            // a subtree because its parent missed silently drops descendants
+                            // that genuinely do intersect the clip polygon. This matches what
+                            // the 1.7+ node-page walk in clip::filter_i3s_scenelayer already
+                            // does; only *keeping* a node is gated on the intersection test.
+                            if let Some(children_arr) = node_val.get("children").and_then(|c| c.as_array()) {
+                                for child_val in children_arr {
+                                    if let Some(cid) = clip::child_id_of(child_val) {
+                                        if !visited.contains(&cid) {
+                                            queue.push_back(cid);
                                         }
                                     }
                                 }
+                            }
+
+                            // No usable bounds: we can't evaluate this node, but its subtree
+                            // has already been queued above.
+                            let Some(mbs) = clip::parse_node_bounds(&node_val) else { continue };
+
+                            let node_bbox = clip::mbs_to_rect(&mbs);
+                            let intersects = polygon_bbox.intersects(&node_bbox)
+                                && clip_polygon.intersects(&node_bbox);
+
+                            if intersects {
+                                keep_uris.insert(containing_doc);
+                                keep_uris.insert(format!("nodes/{}/3dNodeIndexDocument.json", node_id));
+                                kept_node_ids.insert(node_id.clone());
                             }
                         }
                     }
@@ -832,51 +938,132 @@ async fn clip_one_archive(
                 &kept_node_ids,
                 &mut keep_uris,
             );
-            println!("Lazy traversal finished. Kept {} nodes (+{} node resource entries).", kept_node_ids.len(), added);
+            println!(
+                "Traversal finished: visited {} nodes, kept {} (+{} node resource entries).",
+                visited.len(), kept_node_ids.len(), added
+            );
         }
     }
 
     println!("Found {} files that intersect, fetching files ...", keep_uris.len());
 
-    let out_file = AsyncFile::create(output_path).await?;
-    let mut zip_writer = ZipFileWriter::new(out_file.compat_write());
     let pb = if progress {
         let bar = ProgressBar::new(keep_uris.len() as u64);
         bar.set_style(ProgressStyle::default_bar().template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}").unwrap());
         Some(Arc::new(bar))
     } else { None };
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let (tx, mut rx) = mpsc::channel::<DownloadedFile>(concurrency * 2);
+    let (tx, rx) = mpsc::channel::<DownloadedFile>(concurrency * 2);
     let mut fetch_tasks = Vec::new();
 
-    let original_filenames: HashMap<String, String> = archive_entries.iter()
-        .map(|entry| (entry.filename.strip_suffix(".gz").unwrap_or(&entry.filename).to_string(), entry.filename.clone()))
-        .collect();
+    let index_name = if archive_format == ArchiveFormat::Cesium3DTiles {
+        "@3dtilesIndex1@"
+    } else {
+        "@specialIndexFileHASH128@"
+    };
 
-    for (uncompressed_name, original_name) in original_filenames.iter() {
+    // The archive writer runs on the blocking pool, draining the channel with `blocking_recv`.
+    // Writing a zip entry compresses it (Zstandard, for everything but passthrough `.gz`
+    // entries), and doing that inline on the runtime would park a worker for every entry -
+    // stalling the I/O completions of the fetches still in flight, exactly as the decode path
+    // used to. The writer is inherently sequential either way; this just keeps it off the
+    // reactor.
+    let writer_output_path = output_path.to_path_buf();
+    let writer_pb = pb.clone();
+    let writer_handle = tokio::task::spawn_blocking(move || -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let mut rx = rx;
+        let file = StdFile::create(&writer_output_path)?;
+        let mut zip_writer = ZipWriter::new(BufWriter::new(file));
+        let mut written_count = 0usize;
+
+        // Deliberately one entry per `blocking_recv`. Draining in batches via
+        // `blocking_recv_many` was measured to be substantially *worse* (roughly 2x the wall
+        // clock, and more than double the system time on a local source): holding a batch of
+        // payload buffers in flight costs more than the per-entry wakeups it saves.
+        while let Some(file) = rx.blocking_recv() {
+            // Zstandard (ZIP method 93) per the 3D Tiles Archive Format v1.4 spec
+            // (https://github.com/Maxar-Public/3tz-specification) - the same method OWT/Vricon's
+            // own archives already use, and a better read-performance/size trade-off than
+            // DEFLATE. `.gz` entries are stored as-is: they carry their own gzip encoding, and
+            // re-compressing an already-compressed stream only costs time.
+            let method = if file.filename.ends_with(".gz") {
+                CompressionMethod::Stored
+            } else {
+                CompressionMethod::Zstd
+            };
+            // ZIP64 per-entry headers cost bytes on every entry, so only opt in when the
+            // payload genuinely can't be described by a 32-bit size.
+            let options = SimpleFileOptions::default()
+                .compression_method(method)
+                .large_file(needs_zip64(file.data.len()));
+
+            zip_writer.start_file(&file.filename, options)?;
+            zip_writer.write_all(&file.data)?;
+            written_count += 1;
+            if let Some(ref bar) = writer_pb { bar.inc(1); }
+        }
+
+        // The dummy index's placeholder bytes get overwritten in-place with the real index
+        // later, so it must be sized to exactly the real index's length (one 24-byte record per
+        // non-index entry) - not `keep_uris.len()` (only an upper bound: some fetches can fail
+        // and never reach this loop). Sizing it any larger leaves stale zero-padding after the
+        // real index bytes, which the Local File Header still declares as part of the entry's
+        // data - producing a CRC32 mismatch against every other zip reader.
+        let dummy_index = vec![0u8; written_count * 24];
+        zip_writer.start_file(
+            index_name,
+            SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Stored)
+                .large_file(needs_zip64(dummy_index.len())),
+        )?;
+        zip_writer.write_all(&dummy_index)?;
+        zip_writer.finish()?.flush()?;
+        Ok(written_count)
+    });
+
+    // Iterate the Central Directory directly rather than first materializing a
+    // stripped-name -> original-name HashMap over *every* entry in the archive: that map cost
+    // two extra String allocations per entry (millions, for a large .slpk) to answer a
+    // question each entry can answer about itself.
+    for entry in archive_entries.iter() {
+        let uncompressed_name = entry.filename.strip_suffix(".gz").unwrap_or(&entry.filename);
         if !keep_uris.contains(uncompressed_name) { continue; }
 
-        let entry = &archive_entries[entry_index[original_name]];
         let original_was_gzipped = entry.filename.ends_with(".gz");
 
         if let Some(clipped_json) = processed_jsons.get(uncompressed_name) {
+            // We rewrote this JSON's contents, so its `.gz` encoding genuinely has to be
+            // rebuilt - unlike the passthrough path below.
             let data = serde_json::to_string(clipped_json)?.into_bytes();
             let tx_clone = tx.clone();
-            // Clone the name so the spawned task owns a 'static String rather than
-            // borrowing from `original_filenames` (which doesn't outlive the task).
             let uncompressed_name_owned = uncompressed_name.to_string();
 
             fetch_tasks.push(tokio::spawn(async move {
-                if original_was_gzipped {
-                    let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
-                    if encoder.write_all(&data).is_ok() {
-                        if let Ok(gzipped_data) = encoder.finish() {
-                            let _ = tx_clone.send(DownloadedFile { filename: format!("{}.gz", uncompressed_name_owned), data: gzipped_data }).await;
+                let file = if original_was_gzipped {
+                    let name = format!("{}.gz", uncompressed_name_owned);
+                    let encoded = tokio::task::spawn_blocking(move || {
+                        let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
+                        encoder.write_all(&data)?;
+                        encoder.finish()
+                    })
+                    .await;
+                    match encoded {
+                        Ok(Ok(gzipped_data)) => DownloadedFile { filename: name, data: gzipped_data },
+                        // Falling back to the plaintext bytes here would write the entry under
+                        // a name the tileset doesn't reference, so surface it instead.
+                        Ok(Err(e)) => {
+                            eprintln!("\n[ERROR] Failed to gzip rewritten JSON '{}': {}", name, e);
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("\n[ERROR] gzip task for '{}' failed: {}", name, e);
                             return;
                         }
                     }
-                }
-                let _ = tx_clone.send(DownloadedFile { filename: uncompressed_name_owned, data }).await;
+                } else {
+                    DownloadedFile { filename: uncompressed_name_owned, data }
+                };
+                let _ = tx_clone.send(file).await;
             }));
             continue;
         }
@@ -893,16 +1080,22 @@ async fn clip_one_archive(
             let _permit = semaphore_clone.acquire_owned().await.unwrap();
             if let Some(ref bar) = pb_clone { bar.set_message(format!("Fetching {}", entry_clone.filename)); }
 
-            match fetch_file_content(&client_clone, &bucket_clone, &key_clone, &entry_clone).await {
-                Ok(mut data) => {
-                    if original_was_gzipped {
-                        let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
-                        if encoder.write_all(&data).is_ok() {
-                            if let Ok(gzipped_data) = encoder.finish() {
-                                data = gzipped_data;
-                            }
-                        }
-                    }
+            // For an unmodified `.gz` entry the gzip stream is exactly what we want to write
+            // back out (the writer stores `.gz` entries uncompressed), so stop decoding after
+            // the zip layer. Previously this gunzipped and then re-gzipped at the default
+            // level for no change in content - the single most expensive CPU step in the
+            // pipeline, paid once per entry, on I3S archives where nearly everything is `.gz`.
+            let fetched = fetch_entry_decoded(
+                &client_clone,
+                &bucket_clone,
+                &key_clone,
+                &entry_clone,
+                false,
+                max_entry_bytes,
+            ).await;
+
+            match fetched {
+                Ok(data) => {
                     let _ = tx_clone.send(DownloadedFile { filename: entry_clone.filename.clone(), data }).await;
                 },
                 Err(e) => {
@@ -911,80 +1104,75 @@ async fn clip_one_archive(
             };
         }));
     }
+    // Every sender must be gone before the writer's `blocking_recv` loop can end.
     drop(tx);
-
-    let mut written_count: usize = 0;
-    while let Some(file) = rx.recv().await {
-        // Zstandard (ZIP method 93) per the 3D Tiles Archive Format v1.4 spec
-        // (https://github.com/Maxar-Public/3tz-specification) - the same method OWT/Vricon's
-        // own archives already use, and a better read-performance/size trade-off than DEFLATE.
-        let compression = if file.filename.ends_with(".gz") { Compression::Stored } else { Compression::Zstd };
-        let builder = ZipEntryBuilder::new(file.filename.clone().into(), compression);
-        zip_writer.write_entry_whole(builder, &file.data).await?;
-        written_count += 1;
-        if let Some(ref bar) = pb { bar.inc(1); }
-    }
-    for task in fetch_tasks { task.await.unwrap(); }
-
-    let index_name = if archive_format == ArchiveFormat::Cesium3DTiles {
-        "@3dtilesIndex1@"
-    } else {
-        "@specialIndexFileHASH128@"
-    };
-    // The dummy index's placeholder bytes get overwritten in-place with the real index below,
-    // so it must be sized to exactly the real index's length (one 24-byte record per
-    // non-index entry) - not `keep_uris.len()` (only an upper bound: some fetches can fail
-    // and never reach the writer loop above). Sizing it any larger leaves stale zero-padding
-    // after the real index bytes, which the Local File Header still declares as part of the
-    // entry's data - producing a CRC32 mismatch against every other zip reader.
-    let dummy_index = vec![0u8; written_count * 24];
-    zip_writer.write_entry_whole(ZipEntryBuilder::new(index_name.into(), Compression::Stored), &dummy_index).await?;
-    zip_writer.close().await?;
-    if let Some(ref bar) = pb { bar.finish_with_message("Done!"); }
-    println!("Adding index to zipfile ({})...", key);
-    let mut file = tokio::fs::OpenOptions::new().read(true).write(true).open(output_path).await?;
-    let read_file = StdFile::open(output_path)?;
-    let mut final_archive = ZipArchive::new(read_file)?;
-    struct IndexRecord { md5hash: [u8; 16], offset: u64 }
-    let mut tzindex: Vec<IndexRecord> = Vec::new();
-    let mut index_header_offset = 0u64;
-    let mut index_central_header_start = 0u64;
-    for i in 0..final_archive.len() {
-        let file_entry = final_archive.by_index(i)?;
-        if file_entry.name() == index_name {
-            index_header_offset = file_entry.header_start();
-            index_central_header_start = file_entry.central_header_start();
-        } else {
-            let normalized_path = file_entry.name().replace('\\', "/");
-            let digest = md5::compute(normalized_path.as_bytes());
-            tzindex.push(IndexRecord { md5hash: digest.0, offset: file_entry.header_start() });
+    for task in fetch_tasks {
+        if let Err(e) = task.await {
+            eprintln!("[ERROR] Fetch task failed: {}", e);
         }
     }
+    let written_count = writer_handle.await??;
 
-    tzindex.sort_by_key(|x| (u64::from_le_bytes(x.md5hash[0..8].try_into().unwrap()), u64::from_le_bytes(x.md5hash[8..16].try_into().unwrap())));
+    if let Some(ref bar) = pb { bar.finish_with_message("Done!"); }
+    println!("Adding index to zipfile ({})...", key);
 
-    let mut bindex = Vec::with_capacity(tzindex.len() * 24);
-    for i in tzindex {
-        bindex.extend_from_slice(&i.md5hash);
-        bindex.extend_from_slice(&i.offset.to_le_bytes());
-    }
-    let crc32 = crc32fast::hash(&bindex);
-    let index_payload_offset = final_archive.by_name(index_name)?.data_start().expect("Index payload offset not found");
-    file.seek(SeekFrom::Start(index_payload_offset)).await?;
-    file.write_all(&bindex).await?;
-    // The CRC-32 must be patched in *both* places a compliant reader might check it: the
-    // Local File Header (offset 14 past its signature/version/flags/method/modtime/moddate)
-    // and the Central Directory record for the same entry (offset 16 past its own leading
-    // fields - it additionally has a 2-byte "version made by"). Standard zip readers
-    // (Python's zipfile, unzip, etc.) validate against the Central Directory copy, not the
-    // Local File Header - patching only the latter leaves the archive looking corrupt to
-    // every reader except this tool's own index-based one.
-    file.seek(SeekFrom::Start(index_header_offset + 14)).await?;
-    file.write_all(&crc32.to_le_bytes()).await?;
-    file.seek(SeekFrom::Start(index_central_header_start + 16)).await?;
-    file.write_all(&crc32.to_le_bytes()).await?;
+    // Reading back the finished archive's Central Directory and patching the index in place is
+    // all synchronous file I/O over an archive that can be gigabytes - it belongs on the
+    // blocking pool too, not on a runtime worker.
+    let finalize_path = output_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut final_archive = ZipArchive::new(StdFile::open(&finalize_path)?)?;
 
-    println!("Success! Clipped {} -> {}", key, output_path.display());
+        struct IndexRecord { md5hash: [u8; 16], offset: u64 }
+        let mut tzindex: Vec<IndexRecord> = Vec::with_capacity(final_archive.len());
+        let mut index_header_offset = 0u64;
+        let mut index_central_header_start = 0u64;
+        for i in 0..final_archive.len() {
+            let file_entry = final_archive.by_index(i)?;
+            if file_entry.name() == index_name {
+                index_header_offset = file_entry.header_start();
+                index_central_header_start = file_entry.central_header_start();
+            } else {
+                let normalized_path = file_entry.name().replace('\\', "/");
+                let digest = md5::compute(normalized_path.as_bytes());
+                tzindex.push(IndexRecord { md5hash: digest.0, offset: file_entry.header_start() });
+            }
+        }
+
+        tzindex.sort_by_key(|x| (u64::from_le_bytes(x.md5hash[0..8].try_into().unwrap()), u64::from_le_bytes(x.md5hash[8..16].try_into().unwrap())));
+
+        let mut bindex = Vec::with_capacity(tzindex.len() * 24);
+        for i in tzindex {
+            bindex.extend_from_slice(&i.md5hash);
+            bindex.extend_from_slice(&i.offset.to_le_bytes());
+        }
+        let crc32 = crc32fast::hash(&bindex);
+        let index_payload_offset = final_archive
+            .by_name(index_name)?
+            .data_start()
+            .ok_or("Index payload offset not found")?;
+        drop(final_archive);
+
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&finalize_path)?;
+        file.seek(SeekFrom::Start(index_payload_offset))?;
+        file.write_all(&bindex)?;
+        // The CRC-32 must be patched in *both* places a compliant reader might check it: the
+        // Local File Header (offset 14 past its signature/version/flags/method/modtime/moddate)
+        // and the Central Directory record for the same entry (offset 16 past its own leading
+        // fields - it additionally has a 2-byte "version made by"). Standard zip readers
+        // (Python's zipfile, unzip, etc.) validate against the Central Directory copy, not the
+        // Local File Header - patching only the latter leaves the archive looking corrupt to
+        // every reader except this tool's own index-based one.
+        file.seek(SeekFrom::Start(index_header_offset + 14))?;
+        file.write_all(&crc32.to_le_bytes())?;
+        file.seek(SeekFrom::Start(index_central_header_start + 16))?;
+        file.write_all(&crc32.to_le_bytes())?;
+        file.flush()?;
+        Ok(())
+    })
+    .await??;
+
+    println!("Success! Clipped {} ({} entries) -> {}", key, written_count, output_path.display());
     Ok(())
 }
 
@@ -1010,17 +1198,15 @@ struct PackageChild {
 /// ever touches the archive it's given, never the bare outer tileset.json that references
 /// it.
 async fn run_package(
-    s3_client: Arc<S3Client>,
+    s3_client: Arc<ObjectSource>,
     bucket: &str,
     package_key: &str,
     output_dir: &Path,
     clip_polygon: Arc<geo::Polygon<f64>>,
-    concurrency: usize,
-    archive_concurrency: usize,
-    progress: bool,
-    debug: bool,
+    opts: ClipOptions,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("Fetching package tileset s3://{}/{}...", bucket, package_key);
+    let ClipOptions { archive_concurrency, debug, .. } = opts;
+    println!("Fetching package tileset {}...", s3_client.describe(bucket, package_key));
     let package_bytes = s3_client.fetch_object(bucket, package_key).await?;
     let mut package_json: serde_json::Value = serde_json::from_slice(&package_bytes)?;
 
@@ -1113,9 +1299,7 @@ async fn run_package(
                 &archive_key,
                 &output_path,
                 polygon,
-                concurrency,
-                progress,
-                debug,
+                opts,
             ).await;
             (candidate.index, candidate.uri, candidate.region, result)
         }));
@@ -1205,9 +1389,16 @@ async fn run_package(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // reqwest is built with `rustls-tls-webpki-roots-no-provider` so it shares the AWS SDK's
+    // aws-lc-rs backend rather than linking a second (ring) crypto library into the binary.
+    // That deliberately leaves rustls' process-wide provider unset, so install it before any
+    // TLS client is constructed - reqwest's builder panics with "No provider set" otherwise.
+    // An Err here means a provider was already installed, which is exactly what we wanted.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let args = Args::parse();
 
-    if args.package.is_some() {
+    if args.package.is_some() && args.bucket.is_some() {
         const CONCURRENCY_WARN_THRESHOLD: usize = 200;
         let total_connections = args.archive_concurrency.saturating_mul(args.concurrency);
         if total_connections > CONCURRENCY_WARN_THRESHOLD {
@@ -1216,6 +1407,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 args.archive_concurrency, args.concurrency, total_connections
             );
         }
+    }
+
+    let max_entry_bytes = args.max_entry_size * 1024 * 1024;
+    // Every in-flight fetch holds its decompressed entry in memory at once, so the configured
+    // cap is a per-entry ceiling that multiplies by concurrency in the worst case.
+    let peak_decompressed = max_entry_bytes.saturating_mul(args.concurrency as u64);
+    if peak_decompressed > MEMORY_CEILING_WARN_BYTES {
+        eprintln!(
+            "[WARN] --max-entry-size ({} MiB) * --concurrency ({}) allows up to {} GiB of decompressed entries in memory at once. Consider lowering one of these.",
+            args.max_entry_size, args.concurrency, peak_decompressed / (1024 * 1024 * 1024)
+        );
     }
 
     if args.debug {
@@ -1233,7 +1435,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
         .map(|url| format!("https://{}", url))
         .ok();
-    let s3_client = if args.no_sign_request {
+    let source = if args.bucket.is_none() {
+        // Local-filesystem mode: `--key`/`--package` are paths under `--root` (default ".").
+        let root = std::path::PathBuf::from(args.root.as_deref().unwrap_or("."));
+        if !root.is_dir() {
+            return Err(format!("--root '{}' is not a directory", root.display()).into());
+        }
+        if args.no_sign_request {
+            eprintln!("[WARN] --no-sign-request has no effect without --bucket (reading from the local filesystem).");
+        }
+        ObjectSource::Local(root)
+    } else if args.no_sign_request {
         let custom_cert = load_custom_certs()?;
         let mut builder = reqwest::Client::builder().use_rustls_tls();
         if let Some(cert) = custom_cert {
@@ -1244,7 +1456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if args.debug && base_url != "https://s3.amazonaws.com" {
             println!("[DEBUG] Routing anonymous S3 requests to custom endpoint: {}", base_url);
         }
-        S3Client::Unsigned(reqwest_client, base_url)
+        ObjectSource::Unsigned(reqwest_client, base_url)
     } else {
         let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
         let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config).force_path_style(true);
@@ -1252,21 +1464,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if args.debug { println!("[DEBUG] Routing S3 SDK requests to custom endpoint: {}", endpoint); }
             s3_config_builder = s3_config_builder.endpoint_url(endpoint);
         }
-        S3Client::Signed(aws_sdk_s3::Client::from_conf(s3_config_builder.build()))
+        ObjectSource::Signed(aws_sdk_s3::Client::from_conf(s3_config_builder.build()))
     };
-    let s3_client = Arc::new(s3_client);
+    let s3_client = Arc::new(source);
+    let bucket = args.bucket.as_deref().unwrap_or("");
+    let opts = ClipOptions {
+        concurrency: args.concurrency,
+        archive_concurrency: args.archive_concurrency,
+        progress: args.progress,
+        debug: args.debug,
+        max_entry_bytes,
+    };
 
     if let Some(ref package_key) = args.package {
         run_package(
             s3_client,
-            &args.bucket,
+            bucket,
             package_key,
             Path::new(&args.output),
             clip_polygon,
-            args.concurrency,
-            args.archive_concurrency,
-            args.progress,
-            args.debug,
+            opts,
         ).await?;
         return Ok(());
     }
@@ -1274,13 +1491,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let key = args.key.as_ref().unwrap();
     clip_one_archive(
         s3_client,
-        &args.bucket,
+        bucket,
         key,
         Path::new(&args.output),
         clip_polygon,
-        args.concurrency,
-        args.progress,
-        args.debug,
+        opts,
     ).await?;
     Ok(())
 }
@@ -1423,6 +1638,9 @@ mod tests {
         assert!(lookup_entry(&entries, &index, "missing.json").is_none());
     }
 
+    /// A cap comfortably above every payload the tests below build.
+    const TEST_CAP: u64 = 8 * 1024 * 1024;
+
     #[test]
     fn deflate_and_gzip_roundtrip() {
         let payload = b"3d tiles payload data".repeat(100);
@@ -1431,35 +1649,168 @@ mod tests {
         let mut enc = flate2::write::DeflateEncoder::new(&mut deflated, GzCompression::default());
         enc.write_all(&payload).unwrap();
         enc.finish().unwrap();
-        assert_eq!(decompress_deflate(&deflated).unwrap(), payload);
+        assert_eq!(decompress_deflate(&deflated, TEST_CAP).unwrap(), payload);
 
         let mut gzipped = Vec::new();
         let mut enc = GzEncoder::new(&mut gzipped, GzCompression::default());
         enc.write_all(&payload).unwrap();
         enc.finish().unwrap();
-        assert_eq!(decompress_gzip(&gzipped).unwrap(), payload);
+        assert_eq!(decompress_gzip(&gzipped, TEST_CAP).unwrap(), payload);
     }
 
     #[test]
     fn zstd_roundtrip() {
         let payload = b"zstandard entry payload".repeat(50);
         let compressed = zstd::encode_all(&payload[..], 3).unwrap();
-        assert_eq!(decompress_zstd(&compressed).unwrap(), payload);
+        assert_eq!(decompress_zstd(&compressed, TEST_CAP).unwrap(), payload);
     }
 
     #[test]
     fn oversized_decompression_errors_instead_of_truncating() {
-        // A ~65 MiB zero payload deflates to a few hundred KiB but exceeds the 64 MiB
-        // decompressed cap - must error, not silently truncate to corrupt data.
-        let payload = vec![0u8; (MAX_DECOMPRESSED_BYTES + 1024 * 1024) as usize];
+        // A zero payload 1 MiB over the cap compresses to almost nothing but must error,
+        // not silently truncate to corrupt data.
+        let cap = 4 * 1024 * 1024;
+        let payload = vec![0u8; (cap + 1024 * 1024) as usize];
         let mut deflated = Vec::new();
         let mut enc = flate2::write::DeflateEncoder::new(&mut deflated, GzCompression::fast());
         enc.write_all(&payload).unwrap();
         enc.finish().unwrap();
-        let err = decompress_deflate(&deflated).unwrap_err();
+        let err = decompress_deflate(&deflated, cap).unwrap_err();
         assert!(err.to_string().contains("decompressed-size limit"), "unexpected error: {err}");
+        // The message must point at the knob that fixes it.
+        assert!(err.to_string().contains("--max-entry-size"), "unexpected error: {err}");
 
         let compressed = zstd::encode_all(&payload[..], 1).unwrap();
-        assert!(decompress_zstd(&compressed).is_err());
+        assert!(decompress_zstd(&compressed, cap).is_err());
+
+        // The very same payload succeeds once the cap is raised past it - i.e. the limit is
+        // configurable, not a hard format ceiling.
+        assert_eq!(decompress_deflate(&deflated, cap * 4).unwrap().len(), payload.len());
+    }
+
+    #[test]
+    fn needs_zip64_only_past_the_u32_boundary() {
+        // `zip`'s own threshold is `spec::ZIP64_BYTES_THR == u32::MAX`, and it aborts an entry
+        // that crosses it without `large_file`. Being off by one here either corrupts >4 GiB
+        // entries or bloats every header in every archive with ZIP64 extra fields, so pin the
+        // exact boundary - a real >4 GiB entry is far too expensive to write in a unit test.
+        assert!(!needs_zip64(0));
+        assert!(!needs_zip64(u32::MAX as usize - 1));
+        assert!(!needs_zip64(u32::MAX as usize), "exactly u32::MAX still fits");
+        assert!(needs_zip64(u32::MAX as usize + 1), "one byte past must opt in");
+        assert!(needs_zip64(8 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn decode_entry_honours_the_gunzip_flag() {
+        // The `.gz` passthrough path relies on being able to stop after the zip layer, so a
+        // gzip stream stored verbatim must come back out byte-identical.
+        let plaintext = b"i3s node payload".repeat(40);
+        let mut gzipped = Vec::new();
+        let mut enc = GzEncoder::new(&mut gzipped, GzCompression::default());
+        enc.write_all(&plaintext).unwrap();
+        enc.finish().unwrap();
+
+        let stored = zstd::encode_all(&gzipped[..], 3).unwrap();
+        assert_eq!(decode_entry(stored.clone(), 93, false, TEST_CAP).unwrap(), gzipped);
+        assert_eq!(decode_entry(stored, 93, true, TEST_CAP).unwrap(), plaintext);
+    }
+
+    // --- local-filesystem source / speculative range read ---
+
+    /// Build one Local File Header immediately followed by its payload.
+    fn lfh(name: &str, comp_method: u16, extra: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut rec = Vec::new();
+        rec.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]); // signature
+        rec.extend_from_slice(&[20, 0]); // version needed
+        rec.extend_from_slice(&[0, 0]); // flags
+        rec.extend_from_slice(&comp_method.to_le_bytes());
+        rec.extend_from_slice(&[0; 4]); // mod time/date
+        rec.extend_from_slice(&[0; 4]); // crc32
+        rec.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // compressed size
+        rec.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // uncompressed size
+        rec.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        rec.extend_from_slice(&(extra.len() as u16).to_le_bytes());
+        rec.extend_from_slice(name.as_bytes());
+        rec.extend_from_slice(extra);
+        rec.extend_from_slice(payload);
+        rec
+    }
+
+    /// Assemble a whole zip from (name, method, lfh_extra, payload) tuples and write it to a
+    /// scratch dir, returning (root, filename, parsed entries).
+    fn write_archive(tag: &str, files: &[(&str, u16, Vec<u8>, Vec<u8>)]) -> (std::path::PathBuf, String, Vec<CdEntry>) {
+        let mut body = Vec::new();
+        let mut offsets = Vec::new();
+        for (name, method, extra, payload) in files {
+            offsets.push(body.len() as u32);
+            body.extend(lfh(name, *method, extra, payload));
+        }
+        let cd_offset = body.len() as u32;
+        let mut cd = Vec::new();
+        for ((name, method, _, payload), off) in files.iter().zip(&offsets) {
+            cd.extend(cd_record(name, *method, (payload.len() as u32, payload.len() as u32), *off, &[]));
+        }
+        let cd_size = cd.len() as u32;
+        body.extend(&cd);
+        body.extend(eocd_record(cd_size, cd_offset, &[]));
+
+        let root = std::env::temp_dir().join(format!("s3-3tz-clipper-test-{}-{}", std::process::id(), tag));
+        std::fs::create_dir_all(&root).unwrap();
+        let name = "fixture.3tz".to_string();
+        std::fs::write(root.join(&name), &body).unwrap();
+        (root, name, parse_central_directory(&cd))
+    }
+
+    #[tokio::test]
+    async fn local_source_reads_entries_through_speculative_range() {
+        let plain = b"stored tile payload".repeat(20);
+        let deflated = {
+            let mut out = Vec::new();
+            let mut enc = flate2::write::DeflateEncoder::new(&mut out, GzCompression::default());
+            enc.write_all(b"deflated tileset json").unwrap();
+            enc.finish().unwrap();
+            out
+        };
+        // An extra field far larger than LFH_EXTRA_SLOP, to force the exact-payload refetch.
+        let fat_extra = vec![0u8; (LFH_EXTRA_SLOP as usize) * 3];
+
+        let (root, key, entries) = write_archive("range", &[
+            ("stored.b3dm", 0, Vec::new(), plain.clone()),
+            ("tileset.json", 8, Vec::new(), deflated),
+            ("empty.bin", 0, Vec::new(), Vec::new()),
+            ("fat-extra.b3dm", 0, fat_extra, plain.clone()),
+        ]);
+
+        let source = ObjectSource::Local(root.clone());
+        let by_name = |n: &str| entries.iter().find(|e| e.filename == n).unwrap().clone();
+
+        assert_eq!(source.fetch_size("", &key).await.unwrap(), std::fs::metadata(root.join(&key)).unwrap().len());
+
+        // Common case: header + payload arrive in one speculative read.
+        assert_eq!(fetch_raw_entry(&source, "", &key, &by_name("stored.b3dm")).await.unwrap(), plain);
+        // Deflated entry decodes through the full path.
+        assert_eq!(fetch_file_content(&source, "", &key, &by_name("tileset.json"), TEST_CAP).await.unwrap(), b"deflated tileset json");
+        // Zero-length entry: must not underflow its inclusive end offset to u64::MAX.
+        assert!(fetch_raw_entry(&source, "", &key, &by_name("empty.bin")).await.unwrap().is_empty());
+        // Slop miss: the extra field overruns the speculative window, forcing the refetch.
+        assert_eq!(fetch_raw_entry(&source, "", &key, &by_name("fat-extra.b3dm")).await.unwrap(), plain);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn local_source_reports_missing_files_and_describes_paths() {
+        let (root, key, _) = write_archive("missing", &[("a.b3dm", 0, Vec::new(), b"x".to_vec())]);
+        let source = ObjectSource::Local(root.clone());
+
+        assert!(source.fetch_size("", "nope.3tz").await.is_err());
+        assert!(source.fetch_object("", "nope.3tz").await.is_err());
+        // Local mode must not describe its inputs as s3:// URLs.
+        let described = source.describe("ignored-bucket", &key);
+        assert!(described.ends_with("fixture.3tz"), "unexpected description: {described}");
+        assert!(!described.contains("s3://"));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

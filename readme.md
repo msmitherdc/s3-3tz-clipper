@@ -2,7 +2,7 @@
 # S3 3tz Clipper 🛰️
 ### Cloud-Optimized, Multi-Threaded 3D Tiles with 3tz index Clipping Tool
 
-`s3-3tz-clipper` is a Rust-based command-line interface (CLI) for clipping 3D Tiles (`.3tz`) and I3S (`.spk`, `.slpk`) archives directly over S3. Operating on any size dataset, it requires **zero local storage overhead** for the source file, using  HTTP range requests to stream only the required tiles based on a GeoJSON polygon.
+`s3-3tz-clipper` is a Rust-based command-line interface (CLI) for clipping 3D Tiles (`.3tz`) and I3S (`.spk`, `.slpk`) archives directly over S3, **or from a local filesystem path**. Operating on any size dataset, it requires **zero local storage overhead** for the source file, using  HTTP range requests (or positional reads, locally) to stream only the required tiles based on a GeoJSON polygon.
 
 The application features multi-threaded, concurrent S3 downloads, parallel CPU-side decompression, recursive parsing of external nested tilesets, and compliance with the Maxar `.3tz` specification (incorporating the sorted 24-byte binary index `@3dtilesIndex1@`) and the ESRI `.spk` specification (`1.6+`)
 
@@ -11,9 +11,11 @@ The application features multi-threaded, concurrent S3 downloads, parallel CPU-s
 ## 🛠️ Features
 
 *   **Zero-Download Remote Reads**: Streams `.3tz`, `.spk` files directly from any S3 bucket. No local download of the source dataset is ever required.
+*   **Local Filesystem Sources**: Omit `--bucket` to clip an archive already on disk, using the exact same pipeline (positional reads in place of HTTP range requests) - no need to stage it in a bucket first.
 *   **Multi-Threaded Parallel Fetching**: Spawns concurrent background workers to stream and decompress multiple tiles simultaneously from S3
-*   **Parallel Decompression**: Offloads decompression tasks to CPU cores in parallel via the `flate2` crate, bypassing S3 CPU overhead.
+*   **Parallel Decompression**: Offloads decompression to CPU cores in parallel (`flate2`/`zlib-rs` and `zstd`) on a dedicated blocking pool, so decoding never stalls the in-flight S3 fetches sharing the async runtime. Archive writing - and the Zstandard re-compression it performs - runs off-runtime for the same reason.
 *   **Recursive Tileset Resolution**: Recursively resolves and filters nested external tilesets (`.json` files pointing to other `.json` files), ensuring all levels of detail are correctly mapped and clipped.
+*   **Sound I3S Tree Traversal**: The I3S LOD tree is *not* a strict spatial containment hierarchy - a parent's bounding sphere does not always bound its children's. Traversal therefore descends through **every** node regardless of whether it intersects, gating only whether a node is *kept*. Culling a subtree at the first non-intersecting node is faster but silently drops descendants that do intersect.
 *   **Standard & S2 Bounding Volume Support**:
     *   ✅ **Geographic `region`**: Full, exact support for WGS84 bounding volumes.
     *   ✅ **S2 Cells**: Full, exact support for `3DTILES_bounding_volume_S2` cell tokens.
@@ -57,12 +59,13 @@ cargo zigbuild --release --target x86_64-unknown-linux-gnu
 ## 💻 Usage
 
 ```text
-s3-3tz-clipper [OPTIONS] --bucket <BUCKET> (--key <KEY> | --package <KEY>) --geojson <GEOJSON> --output <OUTPUT>
+s3-3tz-clipper [OPTIONS] [--bucket <BUCKET> | --root <DIR>] (--key <KEY> | --package <KEY>) --geojson <GEOJSON> --output <OUTPUT>
 ```
 
 | Flag | Argument | Description |
 |---|---|---|
-| `-b`, `--bucket` | `<BUCKET>` | Raw name of the S3 bucket (do not prefix with `s3://`). |
+| `-b`, `--bucket` | `<BUCKET>` | Raw name of the S3 bucket (do not prefix with `s3://`). **Omit to read from the local filesystem instead** - see `--root`. |
+| `--root` | `<DIR>` | *(Optional)* Base directory for local-filesystem reads. Only meaningful when `--bucket` is omitted; `--key`/`--package` are resolved relative to it. Defaults to the current directory. Mutually exclusive with `--bucket`. |
 | `-k`, `--key` | `<KEY>` | Full path to a single `.3tz`/`.slpk`/`.spk` archive within the bucket (do not start with `/`). Mutually exclusive with `--package`. |
 | `--package` | `<KEY>` | Full path to a *package* tileset.json - a bare (non-archive) JSON file whose `root.children` each reference their own separate archive via `content.uri` (as OWT/Vricon multi-content packages do). Every referenced archive is clipped independently and written under `--output` at the same relative path as its `content.uri`; the package's own tileset.json is rewritten alongside it with each surviving child's (and the root's) `region` shrunk to match. Mutually exclusive with `--key`. |
 | `-g`, `--geojson` | `<GEOJSON>` | Path to the GeoJSON boundary file, or **`-`** to read from `stdin`. |
@@ -70,6 +73,7 @@ s3-3tz-clipper [OPTIONS] --bucket <BUCKET> (--key <KEY> | --package <KEY>) --geo
 | `-p`, `--progress` | | *(Optional)* Show an interactive progress bar. |
 | `-c`, `--concurrency` | `<NUM>` | *(Optional)* Max concurrent S3 downloads within a single archive's tile fetches. Defaults to `20`. |
 | `--archive-concurrency` | `<NUM>` | *(Optional, `--package` mode only)* Max archives clipped in parallel. Defaults to `4`. Each archive additionally uses up to `--concurrency` connections of its own, so total in-flight connections can reach `archive-concurrency * concurrency`. |
+| `--max-entry-size` | `<MiB>` | *(Optional)* Maximum **decompressed** size accepted for a single archive entry. Defaults to `256`. Entries above it are skipped with an error rather than silently truncated, so raise this if a dataset has legitimately huge tiles. It is a zip-bomb guard, not a format limit; peak memory scales with `max-entry-size * concurrency`. |
 | `-d`, `--debug` | | *(Optional)* Print verbose debugging logs. |
 
 ---
@@ -99,7 +103,26 @@ cat ~/myboundary.geojson | ./target/release/s3-3tz-clipper \
   --progress
 ```
 
-### Example 3: Clipping a Package Tileset
+### Example 3: Clipping an Archive Already on Disk
+Omit `--bucket` to read from the local filesystem. `--key` is resolved relative to `--root`
+(or the current directory if `--root` is omitted):
+```bash
+./target/release/s3-3tz-clipper \
+  --root "/data/tilesets" \
+  --key "3dtiles11.3dtiles.3tz" \
+  --geojson "~/myboundary.geojson" \
+  --output "~/myboundary.3tz" \
+  --progress
+```
+An absolute `--key` works too, in which case `--root` can be left off entirely:
+```bash
+./target/release/s3-3tz-clipper \
+  --key "/data/tilesets/3dtiles11.3dtiles.3tz" \
+  --geojson "-" \
+  --output "~/myboundary.3tz" < ~/myboundary.geojson
+```
+
+### Example 4: Clipping a Package Tileset
 Follows `product_package_88e0c/vricon_ste_refined/tileset.json`'s `root.children` out to each of its own per-layer archives (e.g. `terrain.3tz`, `vectors/Aeronautic/HelipadPnt.3tz`, ...), clips up to 8 of them at a time, and mirrors the same relative directory layout - plus a rewritten `tileset.json` - under `--output`:
 ```bash
 ./target/release/s3-3tz-clipper \

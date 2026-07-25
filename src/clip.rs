@@ -93,6 +93,97 @@ fn rad_to_deg(rad: f64) -> f64 {
     rad * 180.0 / std::f64::consts::PI
 }
 
+// --- I3S node parsing (shared by the 1.6 lazy walk and the 1.7+ node-page walk) ---
+
+/// Extract a node's bounds as `[center_lon, center_lat, center_z, radius_meters]`.
+///
+/// I3S 1.6 nodes carry an `mbs` array directly; 1.7+ nodes carry an `obb` (as either an
+/// object with `center`/`halfSize`, or a flat array), which is approximated as the sphere
+/// enclosing the box. Returns `None` when the node declares no usable bounds - callers must
+/// still traverse such a node's children, they just can't decide whether to keep it.
+pub fn parse_node_bounds(node: &JsonValue) -> Option<[f64; 4]> {
+    let mut mbs = [0.0f64; 4];
+
+    if let Some(mbs_arr) = node.get("mbs").and_then(|m| m.as_array()) {
+        if mbs_arr.len() >= 4 {
+            for (i, slot) in mbs.iter_mut().enumerate() {
+                *slot = mbs_arr[i].as_f64().unwrap_or(0.0);
+            }
+            return Some(mbs);
+        }
+        return None;
+    }
+
+    // `obb` in object form: { center: [x,y,z], halfSize: [hx,hy,hz], ... }
+    if let Some(obb) = node.get("obb").and_then(|o| o.as_object()) {
+        let center = obb.get("center").and_then(|c| c.as_array())?;
+        let half_size = obb.get("halfSize").and_then(|h| h.as_array())?;
+        if center.len() < 3 || half_size.len() < 3 {
+            return None;
+        }
+        for (i, slot) in mbs.iter_mut().take(3).enumerate() {
+            *slot = center[i].as_f64().unwrap_or(0.0);
+        }
+        let (hx, hy, hz) = (
+            half_size[0].as_f64().unwrap_or(0.0),
+            half_size[1].as_f64().unwrap_or(0.0),
+            half_size[2].as_f64().unwrap_or(0.0),
+        );
+        mbs[3] = (hx * hx + hy * hy + hz * hz).sqrt();
+        return Some(mbs);
+    }
+
+    // `obb` in flat-array form: [cx, cy, cz, hx, hy, hz, ...]
+    if let Some(obb) = node.get("obb").and_then(|o| o.as_array()) {
+        if obb.len() < 6 {
+            return None;
+        }
+        for (i, slot) in mbs.iter_mut().take(3).enumerate() {
+            *slot = obb[i].as_f64().unwrap_or(0.0);
+        }
+        let (hx, hy, hz) = (
+            obb[3].as_f64().unwrap_or(0.0),
+            obb[4].as_f64().unwrap_or(0.0),
+            obb[5].as_f64().unwrap_or(0.0),
+        );
+        mbs[3] = (hx * hx + hy * hy + hz * hz).sqrt();
+        return Some(mbs);
+    }
+
+    None
+}
+
+/// Project a node's minimum bounding sphere into a degree-space AABB. The metres-per-degree
+/// conversion is approximate, which is fine: this only ever widens/narrows a bbox used for a
+/// conservative intersection test.
+pub fn mbs_to_rect(mbs: &[f64; 4]) -> Rect<f64> {
+    let (center_x, center_y, radius_m) = (mbs[0], mbs[1], mbs[3]);
+    let meters_per_deg_lat = 111320.0;
+    let meters_per_deg_lon = (111320.0 * center_y.to_radians().cos()).max(1.0);
+    let radius_deg_x = radius_m / meters_per_deg_lon;
+    let radius_deg_y = radius_m / meters_per_deg_lat;
+
+    Rect::new(
+        Coord { x: center_x - radius_deg_x, y: center_y - radius_deg_y },
+        Coord { x: center_x + radius_deg_x, y: center_y + radius_deg_y },
+    )
+}
+
+/// Read a child reference's node id. Children appear as a bare number, a bare string, or an
+/// object carrying `id`/`index`, depending on I3S version and producer.
+pub fn child_id_of(child: &JsonValue) -> Option<String> {
+    match child {
+        JsonValue::Number(n) => Some(n.to_string()),
+        JsonValue::String(s) => Some(s.clone()),
+        JsonValue::Object(o) => match o.get("id").or_else(|| o.get("index"))? {
+            JsonValue::String(s) => Some(s.clone()),
+            JsonValue::Number(n) => Some(n.to_string()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 // --- I3S Clipping Logic ---
 
 pub fn filter_i3s_scenelayer(
@@ -164,29 +255,7 @@ pub fn filter_i3s_scenelayer(
         };
 
         // --- Bounding sphere intersection test ---
-        // mbs = [center_lon, center_lat, center_z, radius_meters]
-        let mbs_center_x = node.mbs[0];
-        let mbs_center_y = node.mbs[1];
-        let mbs_radius_meters = node.mbs[3];
-
-        // Convert radius from meters to degrees (approximate, good enough for clipping).
-        let lat_rad = mbs_center_y.to_radians();
-        let meters_per_deg_lat = 111320.0;
-        let meters_per_deg_lon = (111320.0 * lat_rad.cos()).max(1.0);
-
-        let radius_deg_x = mbs_radius_meters / meters_per_deg_lon;
-        let radius_deg_y = mbs_radius_meters / meters_per_deg_lat;
-
-        let node_bbox = Rect::new(
-            Coord {
-                x: mbs_center_x - radius_deg_x,
-                y: mbs_center_y - radius_deg_y,
-            },
-            Coord {
-                x: mbs_center_x + radius_deg_x,
-                y: mbs_center_y + radius_deg_y,
-            },
-        );
+        let node_bbox = mbs_to_rect(&node.mbs);
 
         // Always enqueue children for traversal regardless of whether this node
         // intersects. The I3S LOD tree is NOT a strict spatial containment hierarchy —
@@ -687,6 +756,58 @@ mod tests {
         let mut kept_ids = HashSet::new();
         filter_i3s_scenelayer(&scenelayer, &all_nodes, &unit_polygon(), &mut keep_uris, &mut kept_ids);
         assert!(kept_ids.contains("0"));
+    }
+
+    // --- parse_node_bounds / mbs_to_rect / child_id_of ---
+
+    #[test]
+    fn parse_node_bounds_reads_mbs_and_both_obb_forms() {
+        // I3S 1.6: mbs = [lon, lat, z, radius_m]
+        let mbs = parse_node_bounds(&json!({"mbs": [10.0, 20.0, 5.0, 100.0]})).unwrap();
+        assert_eq!(mbs, [10.0, 20.0, 5.0, 100.0]);
+
+        // I3S 1.7+ obb as an object: radius is the half-diagonal of the box.
+        let obb_obj = parse_node_bounds(&json!({
+            "obb": {"center": [1.0, 2.0, 3.0], "halfSize": [3.0, 4.0, 12.0]}
+        })).unwrap();
+        assert_eq!(&obb_obj[0..3], &[1.0, 2.0, 3.0]);
+        assert!((obb_obj[3] - 13.0).abs() < 1e-9, "half-diagonal of 3/4/12 is 13");
+
+        // obb as a flat array carries the same values positionally.
+        let obb_arr = parse_node_bounds(&json!({"obb": [1.0, 2.0, 3.0, 3.0, 4.0, 12.0]})).unwrap();
+        assert_eq!(obb_obj, obb_arr);
+    }
+
+    #[test]
+    fn parse_node_bounds_rejects_missing_or_short_bounds() {
+        assert!(parse_node_bounds(&json!({})).is_none());
+        assert!(parse_node_bounds(&json!({"mbs": [1.0, 2.0]})).is_none());
+        assert!(parse_node_bounds(&json!({"obb": [1.0, 2.0, 3.0]})).is_none());
+        assert!(parse_node_bounds(&json!({"obb": {"center": [1.0, 2.0, 3.0]}})).is_none());
+    }
+
+    #[test]
+    fn mbs_to_rect_brackets_the_centre() {
+        // A 0-radius sphere degenerates to a point at its centre.
+        let point = mbs_to_rect(&[10.0, 20.0, 0.0, 0.0]);
+        assert_eq!((point.min().x, point.min().y), (10.0, 20.0));
+        assert_eq!((point.max().x, point.max().y), (10.0, 20.0));
+
+        // A real radius expands symmetrically, and further in longitude than latitude away
+        // from the equator (degrees of longitude are shorter there).
+        let rect = mbs_to_rect(&[0.0, 60.0, 0.0, 111_320.0]);
+        assert!((rect.max().y - 61.0).abs() < 1e-6, "1 degree of latitude");
+        assert!(rect.max().x > 1.9 && rect.max().x < 2.1, "~2 degrees of longitude at 60N");
+    }
+
+    #[test]
+    fn child_id_of_reads_every_reference_shape() {
+        assert_eq!(child_id_of(&json!(42)).unwrap(), "42");
+        assert_eq!(child_id_of(&json!("root")).unwrap(), "root");
+        assert_eq!(child_id_of(&json!({"id": "1-2-3"})).unwrap(), "1-2-3");
+        assert_eq!(child_id_of(&json!({"index": 7})).unwrap(), "7");
+        assert!(child_id_of(&json!({"nothing": 1})).is_none());
+        assert!(child_id_of(&json!(null)).is_none());
     }
 
     // --- expand_i3s_keep_set ---
