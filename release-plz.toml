@@ -5,7 +5,12 @@
 #
 # Note this must NOT be expressed as `publish = false` in Cargo.toml: release-plz excludes
 # such packages entirely, so it would report "nothing to release" and never tag anything.
+#
+# `publish` must be set explicitly alongside it: release-plz only rejects the combination when
+# `publish` is explicitly `true`, so leaving it unset silently falls back to the default (true)
+# and it attempts `cargo publish` anyway.
 git_only = true
+publish = false
 git_release_enable = true
 git_tag_enable = true
 # Tag history is mixed: `1.0` through `1.0.8` are bare, but the most recent release is
