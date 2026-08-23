@@ -84,6 +84,17 @@ struct Args {
     /// overriding the `AWS_PROFILE` environment variable (which is still honored when this
     /// is omitted). Only meaningful for signed requests against `--bucket`.
     #[arg(long, value_name = "NAME")] profile: Option<String>,
+    /// AWS region to sign requests for, overriding every other source (`AWS_REGION`, the
+    /// profile's own `region`, instance metadata). Needed when the region that signs the
+    /// request has to differ from the one the selected profile declares - a `--profile` whose
+    /// home region is not where `--bucket` lives, which S3 rejects with
+    /// `AuthorizationHeaderMalformed`.
+    #[arg(long, value_name = "REGION")] region: Option<String>,
+    /// S3 endpoint to send requests to, overriding the `AWS_S3_ENDPOINT` / `AWS_ENDPOINT_URL`
+    /// environment variables. A bare host is assumed to be `https://`. Needed when the
+    /// environment pins an endpoint in one partition (commercial) while `--bucket` lives in
+    /// another (GovCloud, China), which S3 rejects with `AuthorizationHeaderMalformed`.
+    #[arg(long, value_name = "URL")] endpoint_url: Option<String>,
     /// Maximum decompressed size accepted for a single archive entry, in MiB. Entries larger
     /// than this are skipped with an error, so raise it if a dataset has legitimately huge
     /// tiles. Guards against zip bombs; peak memory scales with this * `--concurrency`.
@@ -1428,6 +1439,110 @@ If this tool was launched as a subprocess with a replaced environment (e.g. Pyth
     );
 }
 
+/// The AWS partition a region belongs to. Partitions are separate clouds: an endpoint in one
+/// cannot serve a bucket in another, and credentials do not cross between them either.
+fn partition_of_region(region: &str) -> &'static str {
+    if region.starts_with("us-gov-") {
+        "aws-us-gov"
+    } else if region.starts_with("cn-") {
+        "aws-cn"
+    } else {
+        "aws"
+    }
+}
+
+/// The partition an endpoint serves, or `None` for a host that is not an AWS endpoint at all
+/// (MinIO, OVH, Ceph...), where the question does not apply and no guess should be made.
+fn partition_of_endpoint(endpoint: &str) -> Option<&'static str> {
+    let host = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest)
+        .split('/')
+        .next()?;
+    if host.contains("us-gov-") {
+        Some("aws-us-gov")
+    } else if host.ends_with(".amazonaws.com.cn") {
+        Some("aws-cn")
+    } else if host.ends_with(".amazonaws.com") {
+        Some("aws")
+    } else {
+        None
+    }
+}
+
+/// Warn before the first request when the endpoint in force serves a different partition than
+/// the region being signed for.
+///
+/// The trap is an environment-pinned `AWS_S3_ENDPOINT` (set once for a whole deployment,
+/// commercial by default) combined with a `--profile` whose region is GovCloud: every request
+/// then goes to the commercial cloud carrying a GovCloud signature, and S3 answers with a
+/// bare `AuthorizationHeaderMalformed` naming only the region it wanted - never the endpoint,
+/// which is the half that is actually wrong.
+fn warn_if_endpoint_partition_mismatch(endpoint: &str, region: &str, endpoint_from_flag: bool) {
+    let Some(endpoint_partition) = partition_of_endpoint(endpoint) else {
+        return;
+    };
+    let region_partition = partition_of_region(region);
+    if endpoint_partition == region_partition {
+        return;
+    }
+    eprintln!(
+        "[WARN] endpoint {} serves the '{}' partition, but requests are signed for region '{}' in '{}'. \
+S3 will reject these as AuthorizationHeaderMalformed. {} to reach a bucket in '{}'.",
+        endpoint,
+        endpoint_partition,
+        region,
+        region_partition,
+        if endpoint_from_flag {
+            format!("Pass --endpoint-url https://s3.{}.amazonaws.com", region)
+        } else {
+            format!(
+                "Pass --endpoint-url https://s3.{}.amazonaws.com, or clear AWS_S3_ENDPOINT/AWS_ENDPOINT_URL from this process's environment",
+                region
+            )
+        },
+        region
+    );
+}
+
+/// Turn S3's region-mismatch rejection into an actionable hint.
+///
+/// `AuthorizationHeaderMalformed` names the region the *endpoint* expected, which invites the
+/// wrong conclusion: when a pinned endpoint is the thing at fault, signing for the region it
+/// names would only move the failure (to a bucket that does not exist in that partition).
+/// Both halves are therefore reported - the region signed for, and the endpoint it was sent
+/// to - so the operator can tell which one is wrong.
+fn hint_region_mismatch(
+    err: &(dyn std::error::Error + 'static),
+    signing_region: Option<&str>,
+    endpoint: Option<&str>,
+) {
+    let rendered = format!("{:?}", err);
+    if !rendered.contains("AuthorizationHeaderMalformed") {
+        return;
+    }
+    // The metadata reads: the region 'us-gov-west-1' is wrong; expecting 'us-east-1'
+    let expected = rendered
+        .split_once("expecting '")
+        .and_then(|(_, rest)| rest.split_once('\''))
+        .map(|(region, _)| region);
+    let Some(expected) = expected else { return };
+    let signed = signing_region.unwrap_or("<unknown>");
+    match endpoint {
+        Some(endpoint) => eprintln!(
+            "[HINT] Signed for region '{}', but endpoint {} expects '{}'. If --bucket really is in '{}', \
+the endpoint is what is wrong - pass --endpoint-url https://s3.{}.amazonaws.com (or clear AWS_S3_ENDPOINT/AWS_ENDPOINT_URL). \
+If the bucket is in '{}', pass --region {} instead.",
+            signed, endpoint, expected, signed, signed, expected, expected
+        ),
+        None => eprintln!(
+            "[HINT] Signed for region '{}', but S3 expects '{}'. Pass --region {} to sign for the bucket's own region \
+(a --profile otherwise signs for the region that profile declares).",
+            signed, expected, expected
+        ),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // reqwest is built with `rustls-tls-webpki-roots-no-provider` so it shares the AWS SDK's
@@ -1472,10 +1587,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         geojson_file.read_to_string(&mut geojson_str)?;
     }
     let clip_polygon = Arc::new(clip::parse_geojson_polygon(&geojson_str).expect("Failed to parse GeoJSON"));
-    let custom_endpoint = std::env::var("AWS_S3_ENDPOINT")
-        .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
-        .map(|url| format!("https://{}", url))
-        .ok();
+    // Explicit flag first: the environment variables are typically set once for a whole
+    // deployment, so a single run against a bucket in another partition has to be able to
+    // override them without disturbing everything else that reads them.
+    let custom_endpoint = args
+        .endpoint_url
+        .clone()
+        .or_else(|| {
+            std::env::var("AWS_S3_ENDPOINT")
+                .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+                .ok()
+        })
+        .map(|url| {
+            if url.contains("://") { url } else { format!("https://{}", url) }
+        });
+    // Region the SDK settled on, reported back if S3 rejects the signature (signed mode only).
+    let mut signing_region: Option<String> = None;
     let source = if args.bucket.is_none() {
         // Local-filesystem mode: `--key`/`--package` are paths under `--root` (default ".").
         let root = std::path::PathBuf::from(args.root.as_deref().unwrap_or("."));
@@ -1499,7 +1626,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             builder = builder.add_root_certificate(cert);
         }
         let reqwest_client = builder.build()?;
-        let base_url = custom_endpoint.unwrap_or_else(|| "https://s3.amazonaws.com".to_string());
+        let base_url = custom_endpoint
+            .clone()
+            .unwrap_or_else(|| "https://s3.amazonaws.com".to_string());
         if args.debug && base_url != "https://s3.amazonaws.com" {
             println!("[DEBUG] Routing anonymous S3 requests to custom endpoint: {}", base_url);
         }
@@ -1546,11 +1675,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .or_else("Default", fallback),
                 );
         }
+        // Last word on region, ahead of AWS_REGION and the profile's own `region`: selecting
+        // a profile for its *credentials* also drags in that profile's home region, which is
+        // wrong whenever the bucket lives elsewhere (and fatal when the endpoint is pinned by
+        // AWS_S3_ENDPOINT - the request reaches one region signed for another).
+        if let Some(ref region) = args.region {
+            if args.debug { println!("[DEBUG] Signing for region: {}", region); }
+            loader = loader.region(aws_config::Region::new(region.clone()));
+        }
         let config = loader.load().await;
         let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config).force_path_style(true);
         if let Some(ref endpoint) = custom_endpoint {
             if args.debug { println!("[DEBUG] Routing S3 SDK requests to custom endpoint: {}", endpoint); }
             s3_config_builder = s3_config_builder.endpoint_url(endpoint);
+        }
+        signing_region = config.region().map(|region| region.to_string());
+        if let (Some(endpoint), Some(region)) = (custom_endpoint.as_deref(), signing_region.as_deref()) {
+            warn_if_endpoint_partition_mismatch(endpoint, region, args.endpoint_url.is_some());
         }
         ObjectSource::Signed(aws_sdk_s3::Client::from_conf(s3_config_builder.build()))
     };
@@ -1564,7 +1705,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         max_entry_bytes,
     };
 
-    if let Some(ref package_key) = args.package {
+    let result = if let Some(ref package_key) = args.package {
         run_package(
             s3_client,
             bucket,
@@ -1572,20 +1713,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Path::new(&args.output),
             clip_polygon,
             opts,
-        ).await?;
-        return Ok(());
+        ).await
+    } else {
+        let key = args.key.as_ref().unwrap();
+        clip_one_archive(
+            s3_client,
+            bucket,
+            key,
+            Path::new(&args.output),
+            clip_polygon,
+            opts,
+        ).await
+    };
+    if let Err(ref err) = result {
+        hint_region_mismatch(err.as_ref(), signing_region.as_deref(), custom_endpoint.as_deref());
     }
-
-    let key = args.key.as_ref().unwrap();
-    clip_one_archive(
-        s3_client,
-        bucket,
-        key,
-        Path::new(&args.output),
-        clip_polygon,
-        opts,
-    ).await?;
-    Ok(())
+    result
 }
 
 #[cfg(test)]

@@ -74,6 +74,8 @@ s3-3tz-clipper [OPTIONS] --bucket <BUCKET> --key <KEY> --geojson <GEOJSON> --out
 | `-p`, `--progress` | | *(Optional)* Show an interactive progress bar. |
 | `-c`, `--concurrency` | `<NUM>` | *(Optional)* Max concurrent S3 downloads. Defaults to `10`. |
 | `--profile` | `<NAME>` | *(Optional)* Named profile from `~/.aws/config`/`~/.aws/credentials` to sign requests with, overriding the `AWS_PROFILE` environment variable. |
+| `--region` | `<REGION>` | *(Optional)* Region to sign requests for, overriding `AWS_REGION` and the profile's region. |
+| `--endpoint-url` | `<URL>` | *(Optional)* S3 endpoint to send requests to, overriding `AWS_S3_ENDPOINT`/`AWS_ENDPOINT_URL`. |
 | `-d`, `--debug` | | *(Optional)* Print verbose debugging logs. |
 
 ---
