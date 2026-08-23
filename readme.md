@@ -11,6 +11,7 @@ The application features multi-threaded, concurrent S3 downloads, parallel CPU-s
 ## 🛠️ Features
 
 *   **Zero-Download Remote Reads**: Streams `.3tz`, `.spk` files directly from any S3 bucket. No local download of the source dataset is ever required.
+*   **Named AWS Profiles**: `--profile <NAME>` (or the `AWS_PROFILE` environment variable) signs requests with a specific profile's credentials and region.
 *   **Local Filesystem Sources**: Omit `--bucket` to clip an archive already on disk, using the exact same pipeline (positional reads in place of HTTP range requests) - no need to stage it in a bucket first.
 *   **Multi-Threaded Parallel Fetching**: Spawns concurrent background workers to stream and decompress multiple tiles simultaneously from S3
 *   **Parallel Decompression**: Offloads decompression to CPU cores in parallel (`flate2`/`zlib-rs` and `zstd`) on a dedicated blocking pool, so decoding never stalls the in-flight S3 fetches sharing the async runtime. Archive writing - and the Zstandard re-compression it performs - runs off-runtime for the same reason.
@@ -74,6 +75,7 @@ s3-3tz-clipper [OPTIONS] [--bucket <BUCKET> | --root <DIR>] (--key <KEY> | --pac
 | `-c`, `--concurrency` | `<NUM>` | *(Optional)* Max concurrent S3 downloads within a single archive's tile fetches. Defaults to `20`. |
 | `--archive-concurrency` | `<NUM>` | *(Optional, `--package` mode only)* Max archives clipped in parallel. Defaults to `4`. Each archive additionally uses up to `--concurrency` connections of its own, so total in-flight connections can reach `archive-concurrency * concurrency`. |
 | `--max-entry-size` | `<MiB>` | *(Optional)* Maximum **decompressed** size accepted for a single archive entry. Defaults to `256`. Entries above it are skipped with an error rather than silently truncated, so raise this if a dataset has legitimately huge tiles. It is a zip-bomb guard, not a format limit; peak memory scales with `max-entry-size * concurrency`. |
+| `--profile` | `<NAME>` | *(Optional)* Named profile from `~/.aws/config`/`~/.aws/credentials` to sign requests with, overriding the `AWS_PROFILE` environment variable (still honored when this is omitted). Only meaningful alongside `--bucket`, and without `--no-sign-request`. |
 | `-d`, `--debug` | | *(Optional)* Print verbose debugging logs. |
 
 ---
@@ -134,6 +136,36 @@ Follows `product_package_88e0c/vricon_ste_refined/tileset.json`'s `root.children
   --progress
 ```
 
+### Example 5: Selecting an AWS Profile
+Signs requests with the credentials (and region) of a named profile instead of the default chain:
+```bash
+./target/release/s3-3tz-clipper \
+  --profile "nrl" \
+  --bucket "vantor-jvt-terrain" \
+  --package "Pendleton/.../3d_terrain_pack_refined/tileset.json" \
+  --geojson "~/myboundary.geojson" \
+  --output "/u02/tmp_exports/pendleton" \
+  --archive-concurrency 4 \
+  --concurrency 10
+```
+Equivalent to exporting `AWS_PROFILE=nrl` in the environment; `--profile` wins if both are set.
+
+Naming a profile - by either route - makes that profile's credentials take precedence over
+`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`/`AWS_SESSION_TOKEN` already present in the
+environment, which the SDK's default chain would otherwise consult first. This matters when
+the tool is launched as a subprocess that inherits or copies its parent's environment
+(`subprocess.run(env={**os.environ, "AWS_PROFILE": "nrl"})`): without it, the ambient
+credentials sign every request while the named profile contributes nothing but a region.
+botocore applies the same rule, so this matches what the AWS CLI and boto3 do with the same
+configuration. A profile that cannot supply credentials of its own (one that sets only a
+region, say) still falls back to the normal chain. Run with `--debug` to see which provider
+won - look for `loaded credentials provider=`.
+
+Profiles that authenticate through `credential_process`, static keys, `source_profile`
+role assumption, or web identity all work. **AWS SSO profiles do not** - the `sso` feature of
+`aws-config` is left out of the build to keep the binary small; add it to `Cargo.toml` if you
+need one.
+
 ---
 ## 💡 Environment
 
@@ -148,3 +180,9 @@ both the reqwest anonymous client and the standard aws-sdk-s3 client will automa
 ```bash
 AWS_S3_ENDPOINT=/path/to/custom/aws-s3-endpoint
 ```
+
+### To sign with a named AWS profile use:
+```bash
+AWS_PROFILE=nrl
+```
+equivalent to `--profile nrl`, which takes precedence if both are given.

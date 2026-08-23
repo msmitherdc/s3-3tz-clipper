@@ -1,5 +1,8 @@
 mod clip;
 
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::meta::credentials::CredentialsProviderChain;
+use aws_config::profile::ProfileFileCredentialsProvider;
 use aws_config::BehaviorVersion;
 use clap::Parser;
 use std::fs::File as StdFile;
@@ -77,6 +80,10 @@ struct Args {
     #[arg(long, default_value_t = 4)] archive_concurrency: usize,
     #[arg(long, default_value_t = false)] debug: bool,
     #[arg(long, default_value_t = false)] no_sign_request: bool,
+    /// Named profile from `~/.aws/config`/`~/.aws/credentials` to authenticate with,
+    /// overriding the `AWS_PROFILE` environment variable (which is still honored when this
+    /// is omitted). Only meaningful for signed requests against `--bucket`.
+    #[arg(long, value_name = "NAME")] profile: Option<String>,
     /// Maximum decompressed size accepted for a single archive entry, in MiB. Entries larger
     /// than this are skipped with an error, so raise it if a dataset has legitimately huge
     /// tiles. Guards against zip bombs; peak memory scales with this * `--concurrency`.
@@ -1387,6 +1394,40 @@ async fn run_package(
     Ok(())
 }
 
+/// Warn when a named profile was requested but no profile file is reachable to define it.
+///
+/// The SDK locates `~/.aws/config` through `HOME` (`USERPROFILE` on Windows), so a caller
+/// that hands us a *replaced* environment - `subprocess.run(env={"AWS_PROFILE": ...})` and
+/// friends, which substitute the environment rather than extending it - passes the profile
+/// name through intact while making the file that defines it invisible. The profile then
+/// resolves to nothing and the run dies further downstream with "A region must be set",
+/// which says nothing about the real cause. Explicit file overrides win over `HOME`, matching
+/// the SDK's own lookup order.
+fn warn_if_profile_files_unreachable(profile: &str) {
+    let explicit = ["AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .any(|path| std::path::Path::new(&path).is_file());
+    if explicit {
+        return;
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    if let Some(ref home) = home {
+        let aws_dir = std::path::Path::new(home).join(".aws");
+        if aws_dir.join("config").is_file() || aws_dir.join("credentials").is_file() {
+            return;
+        }
+    }
+    eprintln!(
+        "[WARN] profile '{}' was requested, but no AWS profile file could be found{} - it will resolve to no credentials and no region. \
+If this tool was launched as a subprocess with a replaced environment (e.g. Python's `subprocess.run(env=...)`), pass the existing environment through \
+(`env={{**os.environ, \"AWS_PROFILE\": \"{}\"}}`), or set AWS_CONFIG_FILE/AWS_SHARED_CREDENTIALS_FILE to the profile files explicitly.",
+        profile,
+        if home.is_none() { " (HOME is not set)" } else { " under $HOME/.aws" },
+        profile
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // reqwest is built with `rustls-tls-webpki-roots-no-provider` so it shares the AWS SDK's
@@ -1444,8 +1485,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if args.no_sign_request {
             eprintln!("[WARN] --no-sign-request has no effect without --bucket (reading from the local filesystem).");
         }
+        if args.profile.is_some() {
+            eprintln!("[WARN] --profile/AWS_PROFILE has no effect without --bucket (reading from the local filesystem).");
+        }
         ObjectSource::Local(root)
     } else if args.no_sign_request {
+        if args.profile.is_some() {
+            eprintln!("[WARN] --profile/AWS_PROFILE has no effect with --no-sign-request (requests are anonymous).");
+        }
         let custom_cert = load_custom_certs()?;
         let mut builder = reqwest::Client::builder().use_rustls_tls();
         if let Some(cert) = custom_cert {
@@ -1458,7 +1505,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         ObjectSource::Unsigned(reqwest_client, base_url)
     } else {
-        let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
+        // `profile_name` feeds the whole default chain - region *and* credentials - so a
+        // profile that only sets `region` still works, exactly as `AWS_PROFILE` in the
+        // environment would. Left unset, that environment variable is still honored.
+        let mut loader = aws_config::defaults(BehaviorVersion::latest());
+        // `--profile` overrides AWS_PROFILE, but a profile named either way is only usable if
+        // the file defining it can be found - see warn_if_profile_files_unreachable.
+        let selected_profile = args
+            .profile
+            .clone()
+            .or_else(|| std::env::var("AWS_PROFILE").ok())
+            .filter(|profile| !profile.is_empty());
+        if let Some(ref profile) = selected_profile {
+            if args.debug { println!("[DEBUG] Using AWS profile: {}", profile); }
+            warn_if_profile_files_unreachable(profile);
+            // Naming a profile has to actually *select* its credentials. The SDK's default
+            // chain consults the environment first, so ambient AWS_ACCESS_KEY_ID /
+            // AWS_SESSION_TOKEN - which a caller that inherits or copies its parent's
+            // environment (`subprocess.run(env={**os.environ, "AWS_PROFILE": ...})`) passes
+            // along without meaning to - would otherwise sign every request while the profile
+            // contributed nothing but a region. botocore has the same rule ("an explicitly
+            // provided profile will negate an EnvProvider"), so this matches what the AWS CLI
+            // and boto3 do with the same configuration.
+            //
+            // The default chain stays on as a *fallback* rather than being removed outright:
+            // a profile that sets only a region, or only `role_arn` against instance
+            // metadata, still resolves the way it does today. Only a profile that can supply
+            // credentials itself changes anything here.
+            let profile_credentials = ProfileFileCredentialsProvider::builder()
+                .profile_name(profile)
+                .build();
+            let fallback = DefaultCredentialsChain::builder()
+                .profile_name(profile)
+                .build()
+                .await;
+            loader = loader
+                .profile_name(profile)
+                .credentials_provider(
+                    CredentialsProviderChain::first_try("ExplicitProfile", profile_credentials)
+                        .or_else("Default", fallback),
+                );
+        }
+        let config = loader.load().await;
         let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&config).force_path_style(true);
         if let Some(ref endpoint) = custom_endpoint {
             if args.debug { println!("[DEBUG] Routing S3 SDK requests to custom endpoint: {}", endpoint); }

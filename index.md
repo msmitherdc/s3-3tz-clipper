@@ -73,6 +73,7 @@ s3-3tz-clipper [OPTIONS] --bucket <BUCKET> --key <KEY> --geojson <GEOJSON> --out
 | `-o`, `--output` | `<OUTPUT>` | Local output path where the clipped `.3tz` file will be saved. |
 | `-p`, `--progress` | | *(Optional)* Show an interactive progress bar. |
 | `-c`, `--concurrency` | `<NUM>` | *(Optional)* Max concurrent S3 downloads. Defaults to `10`. |
+| `--profile` | `<NAME>` | *(Optional)* Named profile from `~/.aws/config`/`~/.aws/credentials` to sign requests with, overriding the `AWS_PROFILE` environment variable. |
 | `-d`, `--debug` | | *(Optional)* Print verbose debugging logs. |
 
 ---
