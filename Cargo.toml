@@ -1,6 +1,6 @@
 [package]
 name = "s3-3tz-clipper"
-version = "1.0.11"
+version = "1.0.12"
 edition = "2021"
 
 [dependencies]
@@ -10,7 +10,11 @@ clap = { version = "4.4", features = ["derive"] }
 # the legacy `rustls` feature pinned the deprecated hyper 0.14 + rustls 0.21 +
 # rustls-webpki 0.101 stack, which has open RUSTSEC advisories and duplicated the entire
 # HTTP stack alongside reqwest's.
-aws-config = { version = "1.1.7", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+# `credentials-process` is re-enabled on top of `default-features = false`: without it a
+# profile selected by `--profile`/`AWS_PROFILE` that authenticates through `credential_process`
+# silently resolves to no credentials. It only pulls in `tokio/process`, which `tokio`'s `full`
+# feature above already enables. (`sso` stays off - it would add the aws-sdk-sso/ssooidc crates.)
+aws-config = { version = "1.1.7", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio", "credentials-process"] }
 aws-sdk-s3 = { version = "1.135.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 # `rustls-tls-webpki-roots-no-provider` rather than `rustls-tls`: both bundle the same webpki
 # root store, but plain `rustls-tls` also force-enables rustls' *ring* crypto provider. The
