@@ -76,6 +76,8 @@ s3-3tz-clipper [OPTIONS] [--bucket <BUCKET> | --root <DIR>] (--key <KEY> | --pac
 | `--archive-concurrency` | `<NUM>` | *(Optional, `--package` mode only)* Max archives clipped in parallel. Defaults to `4`. Each archive additionally uses up to `--concurrency` connections of its own, so total in-flight connections can reach `archive-concurrency * concurrency`. |
 | `--max-entry-size` | `<MiB>` | *(Optional)* Maximum **decompressed** size accepted for a single archive entry. Defaults to `256`. Entries above it are skipped with an error rather than silently truncated, so raise this if a dataset has legitimately huge tiles. It is a zip-bomb guard, not a format limit; peak memory scales with `max-entry-size * concurrency`. |
 | `--profile` | `<NAME>` | *(Optional)* Named profile from `~/.aws/config`/`~/.aws/credentials` to sign requests with, overriding the `AWS_PROFILE` environment variable (still honored when this is omitted). Only meaningful alongside `--bucket`, and without `--no-sign-request`. |
+| `--region` | `<REGION>` | *(Optional)* Region to sign requests for, overriding `AWS_REGION` and the profile's own `region`. |
+| `--endpoint-url` | `<URL>` | *(Optional)* S3 endpoint to send requests to, overriding the `AWS_S3_ENDPOINT`/`AWS_ENDPOINT_URL` environment variables. A bare host is assumed to be `https://`. |
 | `-d`, `--debug` | | *(Optional)* Print verbose debugging logs. |
 
 ---
@@ -166,6 +168,46 @@ role assumption, or web identity all work. **AWS SSO profiles do not** - the `ss
 `aws-config` is left out of the build to keep the binary small; add it to `Cargo.toml` if you
 need one.
 
+### Example 6: A Bucket in Another Partition (GovCloud)
+`--profile` selects credentials **and** that profile's region, but the endpoint is a separate
+setting - and `AWS_S3_ENDPOINT`/`AWS_ENDPOINT_URL` are usually set once for a whole
+deployment. If the environment pins the commercial endpoint while the profile signs for
+GovCloud, every request reaches the wrong cloud carrying the right signature, and S3 answers:
+
+```text
+AuthorizationHeaderMalformed: the region 'us-gov-west-1' is wrong; expecting 'us-east-1'
+```
+
+The message names only the region, which is misleading - there the *endpoint* is what is
+wrong. Point it at the bucket's own partition:
+```bash
+./target/release/s3-3tz-clipper \
+  --profile "nrl" \
+  --endpoint-url "https://s3.us-gov-west-1.amazonaws.com" \
+  --bucket "vantor-jvt-terrain" \
+  --package "Pendleton/.../3d_terrain_pack_refined/tileset.json" \
+  --geojson "-" \
+  --output "/u02/tmp_exports/pendleton"
+```
+A profile can carry the endpoint instead of the command line:
+```ini
+[profile nrl]
+region = us-gov-west-1
+endpoint_url = https://s3.us-gov-west-1.amazonaws.com
+```
+but `AWS_S3_ENDPOINT`/`AWS_ENDPOINT_URL` outrank it (as endpoint environment variables outrank
+profile settings throughout the AWS tooling), so a profile endpoint only takes effect if those
+variables are cleared for the process - by a launcher that pops them from the environment it
+passes down, say. `--endpoint-url` outranks everything and needs no such cooperation.
+
+The tool checks this before the first request and warns when the endpoint's partition and the
+signing region's partition disagree, naming the endpoint to pass. That check only sees
+endpoints from `--endpoint-url` or the environment; one coming from a profile is invisible to
+it, and a wrong one there surfaces as the `[HINT]` after S3 rejects the request. It never overrides the
+environment on its own - `--endpoint-url` (or clearing the variables for that process) is the
+only thing that changes where requests go. Endpoints that are not AWS at all (MinIO, Ceph,
+OVH) are left alone entirely.
+
 ---
 ## 💡 Environment
 
@@ -186,3 +228,11 @@ AWS_S3_ENDPOINT=/path/to/custom/aws-s3-endpoint
 AWS_PROFILE=nrl
 ```
 equivalent to `--profile nrl`, which takes precedence if both are given.
+
+**Precedence**, highest first:
+
+| Setting | Order |
+|---|---|
+| Region | `--region` → `AWS_REGION` → the selected profile's `region` → instance metadata |
+| Endpoint | `--endpoint-url` → `AWS_S3_ENDPOINT` → `AWS_ENDPOINT_URL` → the region's own endpoint |
+| Credentials | the selected profile → environment keys → instance metadata |
