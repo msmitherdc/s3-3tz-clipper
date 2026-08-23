@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0](https://github.com/msmitherdc/s3-3tz-clipper/compare/v1.0.13...v1.1.0) - 2026-08-23
+
+### Added
+
+- add --endpoint-url and --region overrides
+
 ## [1.0.13](https://github.com/msmitherdc/s3-3tz-clipper/compare/v1.0.12...v1.0.13) - 2026-08-23
 
 ### Other
