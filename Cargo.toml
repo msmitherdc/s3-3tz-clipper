@@ -51,5 +51,5 @@ flate2 = { version = "1.0", features = ["zlib-rs"] }
 # codecs this tool never reads or writes. `zstd` is required: it is the method the output's own
 # entries use (per the 3tz spec). `deflate-flate2-zlib-rs` covers reading DEFLATE sources.
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd"] }
-zstd = "0.13"
+zstd = "0.14"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
