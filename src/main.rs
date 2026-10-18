@@ -1147,11 +1147,12 @@ async fn clip_one_archive(
         let mut index_central_header_start = 0u64;
         for i in 0..final_archive.len() {
             let file_entry = final_archive.by_index(i)?;
-            if file_entry.name() == index_name {
+            let name = file_entry.name()?;
+            if name == index_name {
                 index_header_offset = file_entry.header_start();
                 index_central_header_start = file_entry.central_header_start();
             } else {
-                let normalized_path = file_entry.name().replace('\\', "/");
+                let normalized_path = name.replace('\\', "/");
                 let digest = md5::compute(normalized_path.as_bytes());
                 tzindex.push(IndexRecord { md5hash: digest.0, offset: file_entry.header_start() });
             }
