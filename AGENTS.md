@@ -35,6 +35,9 @@ touch fetching, archive reading/writing, or traversal.
 
 If `cargo` is not on `PATH`, the toolchain may be installed from conda-forge (see `readme.md`).
 
+Python 3.14 or newer is required for `tests/run_test.sh` and any ad hoc checks. Older
+`zipfile` can't read zstd entries, which is what this tool writes.
+
 ## Coding style
 
 **Match the surrounding code.** This repo is not `rustfmt`-formatted. Do **not** run
@@ -111,6 +114,13 @@ Every behavioural change ships with a test, unless it truly can't be tested (say
 **End-to-end tests** go in `tests/run_test.sh` when a change affects the output archive's
 shape. Assert on contents with `assert_zip_contains`, and gate anything slow or memory-heavy
 behind an env var, as `RUN_ZIP64_TEST` does.
+
+When a change touches archive writing or the index patch, also confirm every entry's CRC
+in the outputs the script leaves behind:
+
+```bash
+python3 -c "import sys, zipfile; [print(f, zipfile.ZipFile(f).testzip() or 'OK') for f in sys.argv[1:]]" clipped-*.3tz clipped-*.spk
+```
 
 ## External dependencies
 
