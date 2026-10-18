@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1](https://github.com/msmitherdc/s3-3tz-clipper/compare/v1.1.0...v1.1.1) - 2026-10-18
+
+### Other
+
+- require Python 3.14 and add CRC check to AGENTS.md
+- update dependencies to clear RustSec advisories
+- add AGENTS.md with coding, testing, and PR conventions
+
 ## [1.1.0](https://github.com/msmitherdc/s3-3tz-clipper/compare/v1.0.13...v1.1.0) - 2026-08-23
 
 ### Added
